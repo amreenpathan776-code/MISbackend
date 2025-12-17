@@ -1,0 +1,35 @@
+{
+  "dependencies": {
+    "axios": "^1.13.1",
+    "body-parser": "^2.2.0",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^17.2.3",
+    "excel": "^1.0.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "iconv-lite": "^0.6.3",
+    "mssql": "^12.0.0",
+    "multer": "^2.0.2",
+    "mysql2": "^3.15.1",
+    "react-native-blob-util": "^0.22.2",
+    "react-native-fs": "^2.20.0",
+    "react-native-pdf": "^6.7.7",
+    "rn-fetch-blob": "^0.12.0",
+    "speakeasy": "^2.0.0",
+    "tunnel-ssh": "^5.2.0",
+    "xlsx": "^0.18.5"
+  },
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "db.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

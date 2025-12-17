@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.log
+*.pem
+*.key
+MISKeys/
+uploads/
+autossh-1.4g/
+autossh-1.4g.tgz
