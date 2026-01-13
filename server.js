@@ -117,8 +117,10 @@ async function queryUTIDatabase(query, params = []) {
   }
 }
 
+
+
 app.get("/backend", (req, res) => {
-  res.send("✅ Backend server is running successfully!");
+  res.send("Backend is working");
 });
 
 //========================= MSSQL MISUAT Connection =========================//
@@ -179,6 +181,35 @@ function stripCommas(value) {
 
   // For non-numeric values, return as is
   return value;
+}
+//==========================================================
+//    level wise rstriction for At A Glance 
+//==========================================================
+function applyLevel1Restriction({
+  userLevel,
+  requestedLevel,
+  branch_code,
+  branch_name,
+  cluster_name,
+}) {
+  // 🔒 Level 1 → ONLY own branch
+  if (userLevel === "Level 1") {
+    return {
+      level: "BRANCH",
+      branch_code,
+      branch_name: branch_code ? null : branch_name,
+      cluster_name: null,
+    };
+  }
+
+  // ✅ Level 2 & Admin → PRESERVE CLUSTER
+  return {
+    level: requestedLevel,
+    branch_code,
+    branch_name,
+    cluster_name:
+      requestedLevel === "CLUSTER" ? cluster_name : null,
+  };
 }
 
 // ===========================================================
@@ -252,17 +283,12 @@ function normalizePhoneOrBranch(input) {
 //=============================================================================================
 app.post("/register", async (req, res) => {
   const { employeeId, phone, password, securityQuestions, deviceId } = req.body;
-  console.log("📩 Register request received:", employeeId);
 
   if (!employeeId || !phone || !password || !deviceId) {
     return res.status(400).json({ message: "All fields are required." });
   }
 
-  if (
-    !Array.isArray(securityQuestions) ||
-    securityQuestions.length !== 3 ||
-    securityQuestions.some((q) => !q.question || !q.answer)
-  ) {
+  if (!Array.isArray(securityQuestions) || securityQuestions.length !== 3) {
     return res.status(400).json({
       message: "Exactly 3 security questions with answers are required.",
     });
@@ -271,17 +297,15 @@ app.post("/register", async (req, res) => {
   const normalizedPhone = normalizePhoneOrBranch(phone);
 
   try {
-    // 1️⃣ Verify employee exists
-    const empQuery = `
-      SELECT Password, device_id, GA_Secret
-      FROM [dbo].[employees]
+    // 1️⃣ Check employee in MASTER
+    const empRows = await queryUTIDatabase(
+      `
+      SELECT [Emp No.], [Designation], [Br Code]
+      FROM [dbo].[employees_master]
       WHERE [Emp No.] = ? AND [Mobile number] = ?
-    `;
-
-    const empRows = await queryUTIDatabase(empQuery, [
-      employeeId,
-      normalizedPhone,
-    ]);
+      `,
+      [employeeId, normalizedPhone]
+    );
 
     if (empRows.length === 0) {
       return res.status(404).json({
@@ -291,60 +315,107 @@ app.post("/register", async (req, res) => {
 
     const emp = empRows[0];
 
-    // 🚫 Already registered (same employee)
-    if (emp.Password || emp.GA_Secret) {
-      return res.status(409).json({
-        message:
-          "Registration already completed for this employee. Contact admin if reset is required.",
-      });
+    // 2️⃣ Already registered?
+    const authRows = await queryUTIDatabase(
+  `
+  SELECT
+    [Password],
+    [GA_Secret],
+    [device_id],
+    [security_q1],
+    [security_q2],
+    [security_q3]
+  FROM [dbo].[employees_auth]
+  WHERE [Emp No.] = ?
+  `,
+  [employeeId]
+);
+
+if (authRows.length === 0) {
+  // This should never happen if trigger is working
+  return res.status(403).json({
+    message: "User not enabled for application access. Contact admin."
+  });
+}
+
+const auth = authRows[0];
+
+// 🚫 If ANY key is already filled → block registration
+const alreadyRegistered =
+  auth.Password ||
+  auth.GA_Secret ||
+  auth.device_id ||
+  auth.security_q1 ||
+  auth.security_q2 ||
+  auth.security_q3;
+
+if (alreadyRegistered) {
+  return res.status(409).json({
+    message: "Registration already completed. Contact admin if reset is required."
+  });
+}
+
+
+    // 3️⃣ Device check
+    const deviceRows = await queryUTIDatabase(
+  `
+  SELECT [Emp No.]
+  FROM [dbo].[employees_auth]
+  WHERE [device_id] = ?
+    AND [Emp No.] <> ?
+  `,
+  [deviceId, employeeId]
+);
+
+if (deviceRows.length > 0) {
+  return res.status(409).json({
+    message: "This device is already registered to another employee.",
+  });
+}
+
+
+    // 4️⃣ Decide Level
+    let level = "Level 1";
+    if (emp.Designation?.includes("Cluster Head")) {
+      level = "Level 2";
+    } else if (emp["Br Code"] === 9999) {
+      level = "Level 3";
     }
 
-    // 🚫 Device already bound to another employee
-    const deviceCheckQuery = `
-      SELECT [Emp No.]
-      FROM [dbo].[employees]
-      WHERE device_id = ?
-    `;
-
-    const deviceRows = await queryUTIDatabase(deviceCheckQuery, [deviceId]);
-
-    if (deviceRows.length > 0) {
-      return res.status(409).json({
-        message:
-          "This device is already registered to another employee. Only one registration is allowed per device.",
-      });
-    }
-
-    // 2️⃣ Generate GA secret ONCE
+    // 5️⃣ Generate GA
     const secret = speakeasy.generateSecret({ length: 32 });
 
-    // 3️⃣ Save registration
-    const updateQuery = `
-      UPDATE [dbo].[employees]
-      SET
-        [Password] = ?,
-        [Approval status] = 'pending',
-        [GA_Secret] = ?,
-        [security_q1] = ?, [security_a1] = ?,
-        [security_q2] = ?, [security_a2] = ?,
-        [security_q3] = ?, [security_a3] = ?,
-        [device_id] = ?
-      WHERE [Emp No.] = ? AND [Mobile number] = ?
-    `;
-
-    await queryUTIDatabase(updateQuery, [
-      password,
-      secret.base32,
-      securityQuestions[0].question,
-      securityQuestions[0].answer,
-      securityQuestions[1].question,
-      securityQuestions[1].answer,
-      securityQuestions[2].question,
-      securityQuestions[2].answer,
-      deviceId,
-      employeeId,
-      normalizedPhone,
-    ]);
+    // 6️⃣ Insert AUTH record
+   // 6️⃣ UPDATE AUTH record (CORRECT)
+const result = await queryUTIDatabase(
+  `
+  UPDATE [dbo].[employees_auth]
+  SET
+    [Password] = ?,
+    [Approval status] = 'pending',
+    [role] = 'user',
+    [GA_Secret] = ?,
+    [security_q1] = ?, [security_a1] = ?,
+    [security_q2] = ?, [security_a2] = ?,
+    [security_q3] = ?, [security_a3] = ?,
+    [device_id] = ?,
+    [Level] = ?
+  WHERE [Emp No.] = ?
+  `,
+  [
+    password,
+    secret.base32,
+    securityQuestions[0].question,
+    securityQuestions[0].answer,
+    securityQuestions[1].question,
+    securityQuestions[1].answer,
+    securityQuestions[2].question,
+    securityQuestions[2].answer,
+    deviceId,
+    level,
+    employeeId,
+  ]
+);
 
     logActivity(employeeId, "User", "Register", `Device:${deviceId}`);
 
@@ -352,6 +423,7 @@ app.post("/register", async (req, res) => {
       message: "Registration successful. Awaiting admin approval.",
       googleAuthKey: secret.base32,
     });
+
   } catch (err) {
     console.error("❌ /register error:", err);
     return res.status(500).json({
@@ -372,71 +444,117 @@ app.post("/login", async (req, res) => {
       return res.status(400).json({ message: "All fields are required." });
     }
 
-    const results = await queryUTIDatabase(`
-      SELECT * FROM [dbo].[employees]
-      WHERE [Emp No.] = ? 
-    `, [employeeId]);
+    /* =================================================
+       1️⃣ FETCH MASTER + AUTH DATA
+    ================================================= */
+    const rows = await queryUTIDatabase(
+      `
+      SELECT
+        m.[Emp No.],
+        m.[Employee Name],
+        m.[Br Code],
+        m.[Branch Name],
+        m.[Designation],
 
-    // INVALID EMPLOYEE ID
-    if (results.length === 0) {
+        a.[Password],
+        a.[Approval status],
+        a.[role],
+        a.[Level],
+        a.[failed_attempts],
+        a.[reset_required],
+        a.[account_locked],
+        a.[device_id],
+        a.[GA_Secret]
+      FROM [dbo].[employees_master] m
+      JOIN [dbo].[employees_auth] a
+        ON m.[Emp No.] = a.[Emp No.]
+      WHERE m.[Emp No.] = ?
+      `,
+      [employeeId]
+    );
+
+    if (rows.length === 0) {
       logActivity(
-  String(employeeId || "UNKNOWN"),
-  "Unknown",
-  "Login Failed",
-  `Employee ${employeeId} does not exist`
-);
+        String(employeeId || "UNKNOWN"),
+        "Unknown",
+        "Login Failed",
+        "Employee not found"
+      );
       return res.status(404).json({ message: "Employee not found." });
     }
 
-    const user = results[0];
-    const role = user.Role || user.role || "user";
+    const user = rows[0];
     const userId = user["Emp No."].toString();
+    const role = user.role || "user";
 
-    // ACCOUNT LOCKED
+    /* =================================================
+       2️⃣ ACCOUNT STATUS CHECKS
+    ================================================= */
     if (user.account_locked) {
       logActivity(userId, role, "Login Failed", "Account locked");
       return res.status(403).json({ message: "Account locked. Contact admin." });
     }
 
-    // ADMIN NOT APPROVED
     if (user["Approval status"] !== "approved") {
       logActivity(userId, role, "Login Failed", "Account not approved");
-      return res.status(403).json({ message: "Account not approved by admin yet." });
+      return res.status(403).json({
+        message: "Account not approved by admin yet.",
+      });
     }
 
-    // PASSWORD RESET REQUIRED
     if (user.reset_required) {
       logActivity(userId, role, "Login Failed", "Password reset required");
-      return res.status(403).json({ message: "Password reset required before login." });
+      return res.status(403).json({
+        message: "Password reset required before login.",
+        forceForgotPassword: true,
+      });
     }
 
-    // WRONG PASSWORD
-    if (user.Password !== password) {
-      const newAttempts = (user.failed_attempts || 0) + 1;
+    /* =================================================
+       3️⃣ PASSWORD CHECK
+    ================================================= */
+// ❌ Wrong password
+if (user.Password !== password) {
+  const newAttempts = (user.failed_attempts || 0) + 1;
 
-      await queryUTIDatabase(
-        "UPDATE [dbo].[employees] SET failed_attempts = ? WHERE [Emp No.] = ?",
-        [newAttempts, employeeId]
-      );
+  await queryUTIDatabase(
+    `
+    UPDATE [dbo].[employees_auth]
+    SET failed_attempts = ?
+    WHERE [Emp No.] = ?
+    `,
+    [newAttempts, employeeId]
+  );
 
-      logActivity(userId, role, "Login Failed", "Invalid password");
+  logActivity(userId, role, "Login Failed", "Invalid password");
 
-      if (newAttempts >= 3) {
-        await queryUTIDatabase(
-          "UPDATE [dbo].[employees] SET reset_required = 1 WHERE [Emp No.] = ?",
-          [employeeId]
-        );
+  // ✅ ONLY ON 3RD ATTEMPT
+  if (newAttempts >= 3) {
+    await queryUTIDatabase(
+      `
+      UPDATE [dbo].[employees_auth]
+      SET reset_required = 1
+      WHERE [Emp No.] = ?
+      `,
+      [employeeId]
+    );
 
-        logActivity(userId, role, "Login Failed", "Account locked due to 3 failed attempts");
-        return res.status(403).json({
-          message: "Too many failed attempts. Password reset required.",
-        });
-      }
+    return res.status(403).json({
+      message: "Password reset required before login.",
+      forceForgotPassword: true,   // 🔥 THIS FLAG IS IMPORTANT
+    });
+  }
 
-      return res.status(401).json({ message: "Invalid password." });
-    }
+  // ✅ 1st & 2nd attempt → NORMAL ERROR ONLY
+  return res.status(401).json({
+    message: "Invalid password.",
+  });
+}
 
-    // WRONG GOOGLE AUTH TOKEN
+
+    /* =================================================
+       4️⃣ GOOGLE AUTHENTICATOR CHECK
+    ================================================= */
     const verified = speakeasy.totp.verify({
       secret: user.GA_Secret,
       encoding: "base32",
@@ -445,14 +563,22 @@ app.post("/login", async (req, res) => {
     });
 
     if (!verified) {
-      logActivity(userId, role, "Login Failed", "Invalid Google Authenticator code");
-      return res.status(401).json({ message: "Invalid Google Authenticator code." });
+      logActivity(userId, role, "Login Failed", "Invalid Google Auth code");
+      return res.status(401).json({
+        message: "Invalid Google Authenticator code.",
+      });
     }
 
-    // WRONG DEVICE
+    /* =================================================
+       5️⃣ DEVICE BINDING
+    ================================================= */
     if (!user.device_id) {
       await queryUTIDatabase(
-        "UPDATE [dbo].[employees] SET device_id = ? WHERE [Emp No.] = ?",
+        `
+        UPDATE [dbo].[employees_auth]
+        SET device_id = ?
+        WHERE [Emp No.] = ?
+        `,
         [deviceId, employeeId]
       );
     } else if (user.device_id !== deviceId) {
@@ -462,9 +588,15 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // SUCCESS LOGIN
+    /* =================================================
+       6️⃣ SUCCESS LOGIN
+    ================================================= */
     await queryUTIDatabase(
-      "UPDATE [dbo].[employees] SET failed_attempts = 0 WHERE [Emp No.] = ?",
+      `
+      UPDATE [dbo].[employees_auth]
+      SET failed_attempts = 0
+      WHERE [Emp No.] = ?
+      `,
       [employeeId]
     );
 
@@ -472,12 +604,12 @@ app.post("/login", async (req, res) => {
       userId,
       role,
       "Login",
-      `User ${user['Employee Name']} logged in`
+      `User ${user["Employee Name"]} logged in`
     );
 
     return res.status(200).json({
       success: true,
-      message: `Welcome, ${user["Employee Name"] || "User"}!`,
+      message: `Welcome, ${user["Employee Name"]}!`,
       role,
       userId,
       level: user.Level,
@@ -485,7 +617,8 @@ app.post("/login", async (req, res) => {
       designation: user.Designation,
       employeeName: user["Employee Name"],
       clusterName:
-        user.Level === "Level 2" && user.Designation?.includes("Cluster Head-")
+        user.Level === "Level 2" &&
+        user.Designation?.includes("Cluster Head-")
           ? user.Designation.replace("Cluster Head-", "").trim()
           : null,
     });
@@ -493,12 +626,15 @@ app.post("/login", async (req, res) => {
   } catch (err) {
     console.error("❌ /login error:", err);
 
-    // Log server error too
-    logActivity("UNKNOWN", "Unknown", "Login Failed", `Server error: ${err.message}`);
+    logActivity(
+      String(req.body?.employeeId || "UNKNOWN"),
+      "Unknown",
+      "Login Failed",
+      `Server error: ${err.message}`
+    );
 
     return res.status(500).json({
       message: "Server error during login.",
-      error: err.message,
     });
   }
 });
@@ -543,10 +679,18 @@ app.post("/forgot-password/start", async (req, res) => {
     }
 
     const query = `
-      SELECT [security_q1], [security_q2], [security_q3], [Role]
-      FROM [dbo].[employees]
-      WHERE [Emp No.] = ? AND [Mobile number] = ?
+      SELECT
+        a.security_q1,
+        a.security_q2,
+        a.security_q3,
+        a.role
+      FROM [dbo].[employees_auth] a
+      JOIN [dbo].[employees_master] m
+        ON a.[Emp No.] = m.[Emp No.]
+      WHERE a.[Emp No.] = ?
+        AND m.[Mobile number] = ?
     `;
+
     const results = await queryUTIDatabase(query, [employeeId, phone]);
 
     if (results.length === 0) {
@@ -554,7 +698,27 @@ app.post("/forgot-password/start", async (req, res) => {
     }
 
     const user = results[0];
-    const role = user.Role || "user";
+    const role = user.role || "user";
+
+    // Question map
+    const questionBank = {
+      q1: "What was the name of your first school?",
+      q2: "What is the name of your favorite childhood teacher?",
+      q3: "What is the title of your favorite childhood book?",
+      q4: "What is the name of your favorite childhood friend?",
+      q5: "What was the make of your first bicycle?",
+      q6: "Where did you go on your first school trip?",
+      q7: "What was the first film you saw in a theater?",
+      q8: "What is the name of your first pet?",
+      q9: "What is your favorite subject in school?",
+      q10: "What was the nickname given to you in childhood?",
+    };
+
+    const securityQuestions = [
+      { id: "q1", text: questionBank[user.security_q1] },
+      { id: "q2", text: questionBank[user.security_q2] },
+      { id: "q3", text: questionBank[user.security_q3] },
+    ];
 
     logActivity(
       employeeId,
@@ -563,148 +727,198 @@ app.post("/forgot-password/start", async (req, res) => {
       "Requested security questions"
     );
 
-    // Utility: Map IDs (q1..q10) to text
-    function mapQuestion(id) {
-      const questionBank = {
-        q1: "What was the name of your first school?",
-        q2: "What is the name of your favorite childhood teacher?",
-        q3: "What is the title of your favorite childhood book?",
-        q4: "What is the name of your favorite childhood friend?",
-        q5: "What was the make of your first bicycle?",
-        q6: "Where did you go on your first school trip?",
-        q7: "What was the first film you saw in a theater?",
-        q8: "What is the name of your first pet?",
-        q9: "What is your favorite subject in school?",
-        q10: "What was the nickname given to you in childhood?",
-      };
-      return questionBank[id] || "Unknown question";
-    }
+    return res.json({ questions: securityQuestions });
 
-    const securityQuestions = [
-      { id: "q1", text: mapQuestion(user.security_q1) },
-      { id: "q2", text: mapQuestion(user.security_q2) },
-      { id: "q3", text: mapQuestion(user.security_q3) },
-    ];
-
-    res.json({ questions: securityQuestions });
   } catch (err) {
-    console.error("❌ Error in /forgot-password/start:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error("❌ /forgot-password/start error:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
 
-// ✅ Step 2: Verify Security Answers
+
 app.post("/verify-security-answers", async (req, res) => {
   try {
     const { employeeId, phone, answers } = req.body;
 
-    const query = `
-      SELECT [security_a1], [security_a2], [security_a3], [reset_attempts],
-             [account_locked], [reset_required], [lock_until], [Role]
-      FROM [dbo].[employees]
-      WHERE [Emp No.] = ? AND [Mobile number] = ?
-    `;
-    const results = await queryUTIDatabase(query, [employeeId, phone]);
+    // -----------------------------
+    // 1️⃣ Fetch user
+    // -----------------------------
+    const rows = await queryUTIDatabase(
+      `
+      SELECT
+        a.security_a1,
+        a.security_a2,
+        a.security_a3,
+        a.reset_attempts,
+        a.lock_until,
+        a.account_locked,
+        a.role
+      FROM employees_auth a
+      JOIN employees_master m
+        ON a.[Emp No.] = m.[Emp No.]
+      WHERE a.[Emp No.] = ?
+        AND m.[Mobile number] = ?
+      `,
+      [employeeId, phone]
+    );
 
-    if (results.length === 0)
+    if (!rows.length) {
       return res.status(404).json({ message: "Employee not found." });
-
-    const user = results[0];
-    const role = user.Role || "user";
-
-    // 🔹 Account locked check
-    if (user.account_locked) {
-      logActivity(
-        employeeId,
-        role,
-        "Forgot Password Attempt",
-        "Account locked, cannot verify answers"
-      );
-      return res
-        .status(403)
-        .json({ message: "Account locked. Contact admin to unlock." });
     }
 
-    // 🔹 Cooldown check
-    if (
-      !user.reset_required &&
-      user.lock_until &&
-      new Date(user.lock_until) > new Date()
-    ) {
-      const waitMinutes = Math.ceil(
-        (new Date(user.lock_until) - new Date()) / (60 * 1000)
-      );
+    const user = rows[0];
+    const role = user.role || "user";
+
+    // -----------------------------
+    // 2️⃣ PERMANENT LOCK
+    // -----------------------------
+    if (user.account_locked) {
       return res.status(403).json({
-        message: `❌ Too many wrong attempts. Please try again after ${waitMinutes} minutes.`,
+        message: "Account locked. Contact admin.",
+        permanentLock: true,
       });
     }
 
-    // 🔹 Check answers (case-insensitive)
-    let correctCount = 0;
-    if (answers.q1?.toLowerCase() === user.security_a1?.toLowerCase())
-      correctCount++;
-    if (answers.q2?.toLowerCase() === user.security_a2?.toLowerCase())
-      correctCount++;
-    if (answers.q3?.toLowerCase() === user.security_a3?.toLowerCase())
-      correctCount++;
+    // -----------------------------
+    // 3️⃣ TEMP LOCK CHECK (SQL TIME)
+    // -----------------------------
+    const lockCheck = await queryUTIDatabase(
+      `
+      SELECT
+        CASE
+          WHEN lock_until IS NOT NULL AND lock_until > GETDATE()
+          THEN DATEDIFF(MINUTE, GETDATE(), lock_until)
+          ELSE 0
+        END AS minutesLeft
+      FROM employees_auth
+      WHERE [Emp No.] = ?
+      `,
+      [employeeId]
+    );
 
-    if (correctCount >= 2) {
-      await queryUTIDatabase(
-        "UPDATE [dbo].[employees] SET reset_attempts=0, lock_until=NULL WHERE [Emp No.]=?",
-        [employeeId]
-      );
-      logActivity(
-        employeeId,
-        role,
-        "Forgot Password Verified",
-        "Security answers verified successfully"
-      );
-      return res.status(200).json({ message: "✅ Verification successful" });
+    const minutesLeft = lockCheck[0].minutesLeft;
+
+    if (minutesLeft > 0) {
+      return res.status(403).json({
+        message: `Too many attempts. Try again after ${minutesLeft} minutes.`,
+        lockActive: true,
+        minutesLeft,
+      });
     }
 
-    // ❌ Wrong answers
-    const newAttempts = (user.reset_attempts || 0) + 1;
+    // -----------------------------
+    // 4️⃣ CLEAR EXPIRED LOCK
+    // -----------------------------
     await queryUTIDatabase(
-      "UPDATE [dbo].[employees] SET reset_attempts=? WHERE [Emp No.]=?",
+      `
+      UPDATE employees_auth
+      SET lock_until = NULL,
+          reset_attempts = 0
+      WHERE [Emp No.] = ?
+        AND lock_until IS NOT NULL
+        AND lock_until <= GETDATE()
+      `,
+      [employeeId]
+    );
+
+    // -----------------------------
+    // 5️⃣ VERIFY ANSWERS
+    // -----------------------------
+    const norm = (v) => v?.trim().toLowerCase();
+    let correct = 0;
+
+    if (norm(answers.q1) === norm(user.security_a1)) correct++;
+    if (norm(answers.q2) === norm(user.security_a2)) correct++;
+    if (norm(answers.q3) === norm(user.security_a3)) correct++;
+
+    if (correct >= 2) {
+      await queryUTIDatabase(
+        `
+        UPDATE employees_auth
+        SET reset_required = 1,
+            reset_attempts = 0,
+            lock_until = NULL
+        WHERE [Emp No.] = ?
+        `,
+        [employeeId]
+      );
+
+      logActivity(employeeId, role, "Forgot Password Verified", "Success");
+
+      return res.json({
+        message: "Verification successful. You may reset your password.",
+        verified: true,
+      });
+    }
+
+    // -----------------------------
+    // 6️⃣ WRONG ANSWER → INCREMENT
+    // -----------------------------
+    const newAttempts = (user.reset_attempts || 0) + 1;
+
+    await queryUTIDatabase(
+      `
+      UPDATE employees_auth
+      SET reset_attempts = ?
+      WHERE [Emp No.] = ?
+      `,
       [newAttempts, employeeId]
     );
-    logActivity(
-      employeeId,
-      role,
-      "Forgot Password Failed Verification",
-      `Wrong answers: ${JSON.stringify(answers)}`
-    );
 
-    if (user.reset_required && newAttempts >= 3) {
+    // -----------------------------
+    // 7️⃣ TEMP LOCK AT 3 ATTEMPTS
+    // -----------------------------
+    if (newAttempts === 3) {
       await queryUTIDatabase(
-        "UPDATE [dbo].[employees] SET account_locked=1 WHERE [Emp No.]=?",
+        `
+        UPDATE employees_auth
+        SET lock_until = DATEADD(MINUTE, 2, GETDATE())
+        WHERE [Emp No.] = ?
+        `,
         [employeeId]
       );
+
       return res.status(403).json({
-        message: "❌ Too many wrong answers. Account locked. Contact admin.",
+        message: "Too many wrong answers. Try again after 2 minutes.",
+        lockActive: true,
+        minutesLeft: 2,
       });
     }
 
-    if (!user.reset_required && newAttempts >= 3) {
-      const lockUntil = new Date(Date.now() + 15 * 60 * 1000); // +15 min
+    // -----------------------------
+    // 8️⃣ PERMANENT LOCK AT 6
+    // -----------------------------
+    if (newAttempts >= 6) {
       await queryUTIDatabase(
-        "UPDATE [dbo].[employees] SET reset_attempts=?, lock_until=? WHERE [Emp No.]=?",
-        [newAttempts, lockUntil, employeeId]
+        `
+        UPDATE employees_auth
+        SET account_locked = 1
+        WHERE [Emp No.] = ?
+        `,
+        [employeeId]
       );
+
       return res.status(403).json({
-        message: "❌ Too many wrong attempts. Try again after 15 minutes.",
+        message: "Account locked. Contact admin.",
+        permanentLock: true,
       });
     }
 
-    return res
-      .status(401)
-      .json({ message: `❌ Wrong answers. Attempts left: ${3 - newAttempts}` });
+    // -----------------------------
+    // 9️⃣ ATTEMPTS LEFT
+    // -----------------------------
+    return res.status(401).json({
+      message: `Wrong answers. Attempts left: ${3 - newAttempts}`,
+    });
+
   } catch (err) {
-    console.error("❌ Error in /verify-security-answers:", err);
-    res.status(500).json({ message: "Server error." });
+    console.error("verify-security-answers error:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
+
+
 
 
 // ✅ Step 3: Reset Password
@@ -713,47 +927,79 @@ app.post("/forgot-password/reset", async (req, res) => {
     const { employeeId, phone, newPassword } = req.body;
 
     if (!employeeId || !phone || !newPassword) {
-      return res.status(400).json({ message: "All fields required." });
+      return res.status(400).json({
+        message: "All fields required.",
+      });
     }
 
-    const getUserQuery = `
-      SELECT [Role]
-      FROM [dbo].[employees]
-      WHERE [Emp No.] = ? AND [Mobile number] = ?
-    `;
-    const userResults = await queryUTIDatabase(getUserQuery, [
-      employeeId,
-      phone,
-    ]);
+    const rows = await queryUTIDatabase(
+      `
+      SELECT
+        a.role,
+        a.account_locked,
+        a.reset_required
+      FROM [dbo].[employees_auth] a
+      JOIN [dbo].[employees_master] m
+        ON a.[Emp No.] = m.[Emp No.]
+      WHERE a.[Emp No.] = ?
+        AND m.[Mobile number] = ?
+      `,
+      [employeeId, phone]
+    );
 
-    if (userResults.length === 0) {
-      return res.status(404).json({ message: "Employee not found." });
+    if (rows.length === 0) {
+      return res.status(404).json({
+        message: "Employee not found.",
+      });
     }
 
-    const role = userResults[0].Role || "user";
+    const user = rows[0];
+    const role = user.role || "user";
 
-    const updateQuery = `
-      UPDATE [dbo].[employees]
-      SET [Password] = ?, [reset_required] = 0, [reset_attempts] = 0, [lock_until] = NULL
-      WHERE [Emp No.] = ? AND [Mobile number] = ?
-    `;
-    await queryUTIDatabase(updateQuery, [newPassword, employeeId, phone]);
+    // 🔒 Permanent lock
+    if (user.account_locked) {
+      return res.status(403).json({
+        message: "Account locked. Please contact admin.",
+      });
+    }
+
+    // 🔐 Ensure security verification happened
+    if (!user.reset_required) {
+      return res.status(403).json({
+        message: "Password reset not authorized. Please verify security answers first.",
+      });
+    }
+
+    // ✅ Reset password (DEVICE REMAINS SAME)
+    await queryUTIDatabase(
+      `
+      UPDATE [dbo].[employees_auth]
+      SET
+        [Password] = ?,
+        reset_required = 0,
+        reset_attempts = 0,
+        lock_until = NULL
+      WHERE [Emp No.] = ?
+      `,
+      [newPassword, employeeId]
+    );
 
     logActivity(
       employeeId,
       role,
       "Password Reset",
-      "Successfully reset password"
+      "Password reset successful (device retained)"
     );
 
-    return res.status(200).json({
-      message: "✅ Password reset successful. You can login now.",
+    return res.json({
+      message: "Password reset successful. You can login from your registered device.",
     });
+
   } catch (err) {
-    console.error("❌ Error in /forgot-password/reset:", err);
-    res
-      .status(500)
-      .json({ message: "Server error while resetting password." });
+    console.error("❌ /forgot-password/reset error:", err);
+    return res.status(500).json({
+      message: "Server error",
+    });
   }
 });
 
@@ -961,7 +1207,7 @@ app.post("/circulars/history", async (req, res) => {
           WHERE ca.circular_id = c.id
         ) AS acknowledged_count
       FROM circulars c
-      LEFT JOIN employees e ON e.[Emp No.] = c.emp_no
+      LEFT JOIN employees_master e ON e.[Emp No.] = c.emp_no
       ORDER BY c.created_at DESC;
     `;
 
@@ -997,35 +1243,46 @@ app.post("/user-stats", async (req, res) => {
   try {
     const query = `
       SELECT
-        CAST(SUM(CASE WHEN [Approval status] = 'approved' THEN 1 ELSE 0 END) AS INT) AS approved,
-        CAST(SUM(CASE WHEN [Approval status] = 'pending' AND Password IS NOT NULL THEN 1 ELSE 0 END) AS INT) AS pending,
-        CAST(SUM(CASE WHEN [Approval status] = 'rejected' THEN 1 ELSE 0 END) AS INT) AS rejected,
-        CAST(SUM(CASE WHEN account_locked = 1 THEN 1 ELSE 0 END) AS INT) AS locked,
-        CAST(COUNT(*) AS INT) AS total_registered,
+        CAST(SUM(CASE WHEN a.[Approval status] = 'approved' THEN 1 ELSE 0 END) AS INT) AS approved,
+        CAST(SUM(CASE WHEN a.[Approval status] = 'pending' THEN 1 ELSE 0 END) AS INT) AS pending,
+        CAST(SUM(CASE WHEN a.[Approval status] = 'rejected' THEN 1 ELSE 0 END) AS INT) AS rejected,
+        CAST(SUM(CASE WHEN a.account_locked = 1 THEN 1 ELSE 0 END) AS INT) AS locked,
+        CAST(COUNT(a.[Emp No.]) AS INT) AS total_registered,
         CAST(
-          (SELECT COUNT(*) FROM [dbo].[employees] WHERE Password IS NULL OR Password = '')
-          AS INT
+          (
+            SELECT COUNT(*)
+            FROM [dbo].[employees_master] m
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM [dbo].[employees_auth] a2
+              WHERE a2.[Emp No.] = m.[Emp No.]
+                AND a2.[Password] IS NOT NULL
+            )
+          ) AS INT
         ) AS not_registered
-      FROM [dbo].[employees]
+      FROM [dbo].[employees_auth] a;
     `;
 
     const rows = await queryUTIDatabase(query, []);
-    const row = rows[0];
+    const row = rows[0] || {};
 
     return res.status(200).json({
-      approved: Number(row.approved),
-      pending: Number(row.pending),
-      rejected: Number(row.rejected),
-      locked: Number(row.locked),
-      total_registered: Number(row.total_registered),
-      not_registered: Number(row.not_registered)
+      approved: Number(row.approved || 0),
+      pending: Number(row.pending || 0),
+      rejected: Number(row.rejected || 0),
+      locked: Number(row.locked || 0),
+      total_registered: Number(row.total_registered || 0),
+      not_registered: Number(row.not_registered || 0),
     });
 
   } catch (err) {
     console.error("❌ Error fetching user stats:", err);
-    return res.status(500).json({ message: "Server error while fetching user stats" });
+    return res.status(500).json({
+      message: "Server error while fetching user stats",
+    });
   }
 });
+
 
 
 // ======================================================================================================
@@ -1033,55 +1290,73 @@ app.post("/user-stats", async (req, res) => {
 // ======================================================================================================
 app.post("/get-users", async (req, res) => {
   try {
-    const { status, page = 1, limit = 10 } = req.body;
+    const { status = "all", page = 1, limit = 10 } = req.body;
     const offset = (page - 1) * limit;
 
     let whereClause = "";
 
-if (status) {
+    if (status === "pending") {
+      whereClause = "WHERE a.[Approval status] = 'pending'";
+    } else if (status === "approved") {
+      whereClause = "WHERE a.[Approval status] = 'approved'";
+    } else if (status === "rejected") {
+      whereClause = "WHERE a.[Approval status] = 'rejected'";
+    } else if (status === "locked") {
+      whereClause = "WHERE a.account_locked = 1";
+    } else if (status === "not_registered") {
+      whereClause = "WHERE a.[Password] IS NULL";
+    }
+    // status === "all" → no WHERE clause
 
-  if (status === "pending") {
-    whereClause = " WHERE [Approval status] = 'pending' AND Password IS NOT NULL AND Password <> ''";
+    // 🔢 COUNT QUERY
+    const countQuery = `
+      SELECT COUNT(*) AS total
+      FROM [dbo].[employees_master] m
+      LEFT JOIN [dbo].[employees_auth] a
+        ON m.[Emp No.] = a.[Emp No.]
+      ${whereClause};
+    `;
 
-  } else if (status === "approved") {
-    whereClause = " WHERE [Approval status] = 'approved'";
-
-  } else if (status === "rejected") {
-    whereClause = " WHERE [Approval status] = 'rejected'";
-
-  } else if (status === "locked") {
-    whereClause = " WHERE account_locked = 1";
-
-  } else if (status === "not_registered") {
-    // ⭐ FIX: Only fetch users whose Password is NULL or empty
-    whereClause = " WHERE (Password IS NULL OR Password = '')";
-  }
-}
-
-    const countQuery = `SELECT COUNT(*) AS total FROM [dbo].[employees] ${whereClause}`;
     const totalResult = await queryUTIDatabase(countQuery, []);
     const total = totalResult[0]?.total || 0;
 
+    // 📄 DATA QUERY
     const usersQuery = `
-      SELECT * FROM [dbo].[employees]
+      SELECT
+        m.[Emp No.],
+        m.[Employee Name],
+        m.[Mobile number],
+        m.[Designation],
+        m.[Branch Name],
+        a.[Approval status],
+        a.account_locked,
+        a.[Level]
+      FROM [dbo].[employees_master] m
+      LEFT JOIN [dbo].[employees_auth] a
+        ON m.[Emp No.] = a.[Emp No.]
       ${whereClause}
-      ORDER BY [Emp No.]
-      OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY
+      ORDER BY m.[Emp No.]
+      OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY;
     `;
+
     const results = await queryUTIDatabase(usersQuery, []);
 
-    res.json({
+    return res.json({
       total,
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: Number(page),
+      limit: Number(limit),
       totalPages: Math.ceil(total / limit),
       users: results,
     });
+
   } catch (err) {
-    console.error("❌ Error fetching users (UTI):", err);
-    return res.status(500).json({ message: "Server error while fetching users" });
+    console.error("❌ Error fetching users:", err);
+    return res.status(500).json({
+      message: "Server error while fetching users",
+    });
   }
 });
+
 
 // =============================================================================================
 //                                     ✅ Update User Status
@@ -1091,55 +1366,63 @@ app.post("/update-user-status", async (req, res) => {
     let { empNo, status, adminId, adminRole } = req.body;
 
     if (!empNo || !status) {
-      return res.status(400).json({ message: "Employee number and status are required" });
+      return res.status(400).json({
+        message: "Employee number and status are required",
+      });
     }
 
-    // Convert empNo to integer (removes commas like 1,011)
+    // Clean employee number (handles commas like 1,011)
     const cleanEmpNo = parseInt(String(empNo).replace(/[, ]/g, ""), 10);
 
     if (isNaN(cleanEmpNo)) {
-      return res.status(400).json({ message: "Invalid Employee Number" });
+      return res.status(400).json({
+        message: "Invalid Employee Number",
+      });
     }
 
-    // -------------------------
-    // 1️⃣ RUN UPDATE QUERY
-    // -------------------------
-    const updateQuery = `
-      UPDATE [dbo].[employees]
+    // Allow only valid statuses
+    const allowedStatuses = ["approved", "rejected", "pending"];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        message: "Invalid status value",
+      });
+    }
+
+    // 1️⃣ Update approval status in AUTH table
+    await queryUTIDatabase(
+      `
+      UPDATE [dbo].[employees_auth]
       SET [Approval status] = ?
       WHERE [Emp No.] = ?
-    `;
+      `,
+      [status, cleanEmpNo]
+    );
 
-    await queryUTIDatabase(updateQuery, [status, cleanEmpNo]);
-
-    // -------------------------
-    // 2️⃣ VERIFY UPDATE SUCCESS USING SELECT
-    // -------------------------
-    const checkQuery = `
-      SELECT [Emp No.], [Approval status]
-      FROM [dbo].[employees]
-      WHERE [Emp No.] = ?
-    `;
-
-    const rows = await queryUTIDatabase(checkQuery, [cleanEmpNo]);
-
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({
-        message: `❌ Employee ${cleanEmpNo} not found — record not updated`
-      });
+    // 2️⃣ Optional: If rejected, clear auth-sensitive fields
+    if (status === "rejected") {
+      await queryUTIDatabase(
+        `
+        UPDATE [dbo].[employees_auth]
+        SET
+          [Password] = NULL,
+          [GA_Secret] = NULL,
+          [device_id] = NULL,
+          [security_q1] = NULL,
+          [security_a1] = NULL,
+          [security_q2] = NULL,
+          [security_a2] = NULL,
+          [security_q3] = NULL,
+          [security_a3] = NULL,
+          failed_attempts = 0,
+          reset_required = 0,
+          account_locked = 0
+        WHERE [Emp No.] = ?
+        `,
+        [cleanEmpNo]
+      );
     }
 
-    // (Optional) verify that status actually updated
-    const updatedStatus = rows[0]["Approval status"];
-    if (updatedStatus !== status) {
-      return res.status(500).json({
-        message: `❌ Update failed — status did not change`
-      });
-    }
-
-    // -------------------------
-    // 3️⃣ LOG ACTIVITY
-    // -------------------------
+    // 3️⃣ Log admin action
     logActivity(
       adminId || "system",
       adminRole || "admin",
@@ -1147,20 +1430,23 @@ app.post("/update-user-status", async (req, res) => {
       `Set user ${cleanEmpNo} to ${status}`
     );
 
-    return res.json({ message: `User ${status} successfully` });
+    return res.status(200).json({
+      success: true,
+      message: `User ${cleanEmpNo} ${status} successfully`,
+    });
 
   } catch (err) {
-    console.error("❌ Error updating user status (UTI):", err);
-    return res.status(500).json({ message: "Server error while updating user status" });
+    console.error("❌ Error updating user status:", err);
+    return res.status(500).json({
+      message: "Server error while updating user status",
+    });
   }
 });
-
 
 // ===================================================================================================
 //                                                ✅ Unlock User
 // ===================================================================================================
-// Utility to remove commas, decimals, and formatting
-// Utility to remove commas, decimals, and formatting
+// Utility to clean employee/admin numbers
 function cleanNumber(value) {
   if (!value) return null;
   return value.toString().replace(/,/g, "").replace(/\.00$/, "").trim();
@@ -1177,75 +1463,50 @@ app.post("/unlock-user", async (req, res) => {
       });
     }
 
-    // Clean formatting "1,009.00" → "1009"
     const cleanEmpNo = cleanNumber(empNo);
     const cleanAdminId = cleanNumber(adminId);
 
-    const query = `
-      UPDATE [dbo].[employees]
-      SET failed_attempts = 0,
-          account_locked = 0,
-          attempts = 0,
-          reset_attempts = 0,
-          lock_until = NULL,
-          reset_required = 0
+    // 1️⃣ Unlock user in AUTH table
+    await queryUTIDatabase(
+      `
+      UPDATE [dbo].[employees_auth]
+      SET
+        failed_attempts = 0,
+        account_locked = 0,
+        attempts = 0,
+        reset_attempts = 0,
+        lock_until = NULL,
+        reset_required = 0
       WHERE [Emp No.] = ?
-    `;
+      `,
+      [cleanEmpNo]
+    );
 
-    const result = await queryUTIDatabase(query, [cleanEmpNo]);
-
-    // 🛑 SAFETY CHECK — result must exist
-    if (!result) {
-      console.error("❌ Unlock-user: queryUTIDatabase returned undefined");
-      return res.status(500).json({
-        success: false,
-        message: "Database error: No response received",
-      });
+    // 2️⃣ Log admin action (never block main flow)
+    try {
+      logActivity(
+        cleanAdminId || "system",
+        adminRole || "admin",
+        "Unlock User",
+        `Unlocked user ${cleanEmpNo}`
+      );
+    } catch (logErr) {
+      console.error("⚠ logActivity failed:", logErr);
     }
 
-    console.log("Unlock-user SQL result:", result);
-
-    // 🛑 SAFETY: rowsAffected may not exist in your wrapper
-    const rows =
-      result.rowsAffected?.[0] ??
-      result.rowsAffected ??
-      result.affectedRows ??
-      0;
-
-    if (rows > 0) {
-      // Log activity safely (never crash main route)
-      try {
-        logActivity(
-          cleanAdminId || "system",
-          adminRole || "admin",
-          "Unlock User",
-          `Unlocked user ${cleanEmpNo}`
-        );
-      } catch (logErr) {
-        console.error("⚠ logActivity failed:", logErr);
-      }
-
-      return res.json({
-        success: true,
-        message: "User unlocked successfully",
-      });
-    }
-
-    // If update returned 0 rows
-    return res.status(404).json({
-      success: false,
-      message: "User not found",
+    return res.json({
+      success: true,
+      message: "User unlocked successfully",
     });
 
   } catch (err) {
-    console.error("❌ Unlock user error (UTI):", err);
+    console.error("❌ Unlock user error:", err);
     return res.status(500).json({
       success: false,
       message: "Server error while unlocking user",
     });
   }
 });
-
 
 // --------------------------------------------------------------------------------------------
 //          FETCH DISTINCT DISTRICTS & CLUSTERS (Mapping-based, NOT Hardcoded)
@@ -1658,6 +1919,9 @@ app.post("/get-deposits-accounts", async (req, res) => {
     }
 
     const SECTION = "deposits_accounts_opened";
+const HIDDEN_DEPOSITS_MEANINGS = new Set([
+  "vouchers",
+]);
 
     //========================================================================================
     // 1️⃣ LOAD MEANING → colX MAPPING
@@ -1672,13 +1936,18 @@ app.post("/get-deposits-accounts", async (req, res) => {
       [SECTION]
     );
 
-    let mapping = mappingRows.map((m) => ({
-      colNumber: Number(m.col_number),
-      colName: `col${m.col_number}`,
-      displayLabel: m.display_label,
-      meaning: m.meaning,
-      type: m.detected_type || "string",
-    }));
+let mapping = mappingRows
+  .map((m) => ({
+    colNumber: Number(m.col_number),
+    colName: `col${m.col_number}`,
+    displayLabel: m.display_label,
+    meaning: m.meaning,
+    type: m.detected_type || "string",
+  }))
+  .filter(
+    (m) =>
+      !m.meaning || !HIDDEN_DEPOSITS_MEANINGS.has(m.meaning) // 🔥 hide vouchers
+  );
 
     if (!mapping.length) {
       mapping = [];
@@ -2215,6 +2484,14 @@ app.post("/get-npa", async (req, res) => {
     districtName = (districtName || "").trim();
     level = level || "Level 1";
 	
+	const HIDDEN_NPA_MEANINGS = new Set([
+  "unstamped_npa_prev_accounts",
+  "unstamped_npa_prev_balance",
+  "npa_monthly_accounts",
+  "npa_monthly_balance",
+]);
+
+	
 	// ===============================
 // FIX: Level 1 branchCode "2.00" → "2"
 // ===============================
@@ -2244,13 +2521,20 @@ if (level === "Level 1" && branchCode) {
       [SECTION]
     );
 
-    let mapping = (mappingRows || []).map((m) => ({
-      colNumber: Number(m.col_number),
-      colName: `col${m.col_number}`,
-      displayLabel: m.display_label,
-      meaning: m.meaning || null,
-      detectedType: m.detected_type || "string",
-    }));
+    let mapping = (mappingRows || [])
+  .map((m) => ({
+    colNumber: Number(m.col_number),
+    colName: `col${m.col_number}`,
+    displayLabel: m.display_label,
+    meaning: m.meaning || null,
+    detectedType: m.detected_type || "string",
+  }))
+  .filter(
+    (m) =>
+      !m.meaning ||                    // keep columns without meaning
+      !HIDDEN_NPA_MEANINGS.has(m.meaning) // 🔥 hide unwanted NPA columns
+  );
+
 
     // Fallback (rare)
     if (!mapping.length) {
@@ -3093,6 +3377,9 @@ app.post("/get-daocs", async (req, res) => {
     const { userId, role, level, clusterName, branchCode, designation } = req.body;
 
     const SECTION = "DAOCS"; // mapping section
+const HIDDEN_DAOCS_MEANINGS = new Set([
+  "vouchers",
+]);
 
     // 1️⃣ LOAD MAPPING FOR DAOCS
     const mappingRows = await queryUTIDatabase(
@@ -3112,13 +3399,17 @@ app.post("/get-daocs", async (req, res) => {
           "⚠️ DAOCS summary mapping not found. Please upload DAOCS MIS first.",
       });
     }
-
-    const mapping = mappingRows.map((m) => ({
-      colNumber: Number(m.col_number),
-      colName: `col${m.col_number}`,
-      displayLabel: m.display_label,
-      meaning: m.meaning || null,
-    }));
+const mapping = mappingRows
+  .map((m) => ({
+    colNumber: Number(m.col_number),
+    colName: `col${m.col_number}`,
+    displayLabel: m.display_label,
+    meaning: m.meaning || null,
+  }))
+  .filter(
+    (m) =>
+      !m.meaning || !HIDDEN_DAOCS_MEANINGS.has(m.meaning) // 🔥 hide vouchers
+  );
 
     // Meaning lookup table
     const byMeaning = {};
@@ -3493,6 +3784,14 @@ app.post("/get-npa-summary", async (req, res) => {
     const { userId, role, level, clusterName } = req.body;
     const SECTION = "NPACS";
 
+    // 🔒 Hidden meanings (same as /get-npa)
+    const HIDDEN_NPACS_MEANINGS = new Set([
+      "unstamped_npa_prev_accounts",
+      "unstamped_npa_prev_balance",
+      "npa_monthly_accounts",
+      "npa_monthly_balance",
+    ]);
+
     // 1️⃣ Load mapping
     const mappingRows = await queryUTIDatabase(
       `
@@ -3500,7 +3799,7 @@ app.post("/get-npa-summary", async (req, res) => {
       FROM MIS.dbo.MIS_Column_Mapping
       WHERE section = ?
       ORDER BY col_number ASC
-    `,
+      `,
       [SECTION]
     );
 
@@ -3511,12 +3810,18 @@ app.post("/get-npa-summary", async (req, res) => {
       });
     }
 
-    const mapping = mappingRows.map((m) => ({
-      colNumber: Number(m.col_number),
-      colName: `col${m.col_number}`,
-      displayLabel: m.display_label,
-      meaning: m.meaning || null,
-    }));
+    // 🔥 Apply hiding at mapping level
+    const mapping = mappingRows
+      .map((m) => ({
+        colNumber: Number(m.col_number),
+        colName: `col${m.col_number}`,
+        displayLabel: m.display_label,
+        meaning: m.meaning || null,
+      }))
+      .filter(
+        (m) =>
+          !m.meaning || !HIDDEN_NPACS_MEANINGS.has(m.meaning)
+      );
 
     // quick lookup meaning -> colName
     const byMeaning = {};
@@ -3530,10 +3835,13 @@ app.post("/get-npa-summary", async (req, res) => {
       branch_name: "col2",
       district: "col3",
     };
-    const getColByMeaning = (meaning) => byMeaning[meaning] || fallback[meaning] || null;
+
+    const getColByMeaning = (meaning) =>
+      byMeaning[meaning] || fallback[meaning] || null;
+
     const clusterCol = getColByMeaning("cluster") || "col1";
 
-    // Select list based on mapping col names
+    // Select list based on filtered mapping
     const colList = mapping.map((m) => `[${m.colName}]`).join(", ");
 
     // 2️⃣ Build SQL + level filter
@@ -3545,7 +3853,7 @@ app.post("/get-npa-summary", async (req, res) => {
       params.push(clusterName.trim().toLowerCase());
     }
 
-    // 3️⃣ Custom ordering (preserve your current ordering logic)
+    // 3️⃣ Custom ordering (unchanged)
     query += `
       ORDER BY CASE 
         WHEN LTRIM(RTRIM([${clusterCol}])) = 'Krishna' THEN 1
@@ -3582,23 +3890,23 @@ app.post("/get-npa-summary", async (req, res) => {
       const obj = {};
       mapping.forEach((m) => {
         const raw = r[m.colName];
-        obj[m.displayLabel] = raw === null || raw === undefined || raw === "" ? "-" : raw;
+        obj[m.displayLabel] =
+          raw === null || raw === undefined || raw === "" ? "-" : raw;
       });
       return obj;
     });
 
-    // 5️⃣ Static headers (keep cluster/branch/district static)
+    // 5️⃣ Static headers
     const staticSet = new Set(["cluster", "branch_code", "branch_name", "district"]);
+
     const staticHeaders = mapping
       .filter((m) => m.meaning && staticSet.has(m.meaning))
       .map((m) => m.displayLabel);
 
-    // 6️⃣ Grouped headers — Option B: keep FULL parent titles (including dates / "As on Date")
-    // Rule: split last token (A/Cs, Amount, Balance) -> child label; parent = everything before last token
+    // 6️⃣ Grouped headers
     const groupMap = new Map();
 
     mapping.forEach((m) => {
-      // skip static meanings
       if (m.meaning && staticSet.has(m.meaning)) return;
 
       const label = (m.displayLabel || "").trim();
@@ -3607,12 +3915,15 @@ app.post("/get-npa-summary", async (req, res) => {
       const parts = label.split(/\s+/);
       let parent = label;
       let child = label;
+
       if (parts.length > 1) {
-        child = parts[parts.length - 1]; // A/Cs, Balance, Amount
+        child = parts[parts.length - 1];
         parent = parts.slice(0, -1).join(" ");
       }
 
-      if (!groupMap.has(parent)) groupMap.set(parent, { title: parent, cols: [] });
+      if (!groupMap.has(parent)) {
+        groupMap.set(parent, { title: parent, cols: [] });
+      }
 
       groupMap.get(parent).cols.push({
         key: m.displayLabel,
@@ -3622,10 +3933,12 @@ app.post("/get-npa-summary", async (req, res) => {
 
     const groupedHeaders = Array.from(groupMap.values());
 
-    // 7️⃣ Build meaningMap: meaning -> displayLabel (frontend will use this to pick pie column)
+    // 7️⃣ Meaning map (only visible columns)
     const meaningMap = {};
     mapping.forEach((m) => {
-      if (m.meaning) meaningMap[m.meaning] = m.displayLabel;
+      if (m.meaning) {
+        meaningMap[m.meaning] = m.displayLabel;
+      }
     });
 
     const totalRecords = rows.length;
@@ -3646,6 +3959,7 @@ app.post("/get-npa-summary", async (req, res) => {
     });
   }
 });
+
 
 //============================================================================================
 //                             LOANS SANCTIONED SUMMARY (Dynamic Mapping + Grouped Headers)
@@ -3942,7 +4256,7 @@ app.post("/get-sma-denormalized", async (req, res) => {
     // ⭐⭐⭐ LEVEL-1 MUST GET branch_code FROM USERS TABLE
     if (level === "Level 1") {
       const userBranch = await queryUTIDatabase(
-        `SELECT [Br Code] FROM dbo.employees WHERE [Emp No.] = ?`,
+        `SELECT [Br Code] FROM dbo.employees_master WHERE [Emp No.] = ?`,
         [userId]
       );
 
@@ -3974,19 +4288,25 @@ app.post("/get-sma-denormalized", async (req, res) => {
       const num = parseFloat(branchCode);
       if (!isNaN(num)) branchCode = parseInt(num, 10).toString();
     }
+const HIDDEN_SMA_MEANINGS = new Set([
+  "sma_fy_accounts",
+  "sma_fy_balance",
+]);
 
     //========================================================================================
     // 1️⃣ LOAD SMA MAPPING (meaning → colX)
     //========================================================================================
     const mappingRows = await queryUTIDatabase(
-      `
-      SELECT col_number, display_label, meaning, detected_type
-      FROM MIS.dbo.MIS_Column_Mapping
-      WHERE section = ?
-      ORDER BY col_number ASC
-      `,
-      [SECTION]
-    );
+  `
+  SELECT col_number, display_label, meaning, detected_type
+  FROM MIS.dbo.MIS_Column_Mapping
+  WHERE section = ?
+    AND col_number BETWEEN 1 AND 30
+  ORDER BY col_number
+  `,
+  [SECTION]
+);
+
 
     if (!mappingRows.length) {
       return res.status(400).json({
@@ -3994,14 +4314,20 @@ app.post("/get-sma-denormalized", async (req, res) => {
         message: "SMA mapping not found. Upload SMA MIS first.",
       });
     }
+const mapping = mappingRows
+  .map((m) => ({
+    colNumber: Number(m.col_number),
+    colName: `col${m.col_number}`,
+    displayLabel: m.display_label,
+    meaning: m.meaning,
+    type: m.detected_type,
+  }))
+  .filter(
+    (m) =>
+      !m.meaning ||                 // keep columns without meaning
+      !HIDDEN_SMA_MEANINGS.has(m.meaning) // 🔥 hide FY SMA columns
+  );
 
-    const mapping = mappingRows.map((m) => ({
-      colNumber: Number(m.col_number),
-      colName: `col${m.col_number}`,
-      displayLabel: m.display_label,
-      meaning: m.meaning,
-      type: m.detected_type,
-    }));
 
     const meaningToCol = {};
     mapping.forEach((m) => {
@@ -4743,7 +5069,7 @@ app.post("/get-daily-summary", async (req, res) => {
       whereClauses.push(`
         branch_code = (
           SELECT TOP 1 [Br Code]
-          FROM employees
+          FROM employees_master
           WHERE [Emp No.] = CAST(? AS INT)
         )
       `);
@@ -4989,7 +5315,7 @@ app.post("/get-daily-summary-trend", async (req, res) => {
     if (level === "Level 1") {
       const userBranch = await queryUTIDatabase(`
         SELECT TOP 1 CAST([Br Code] AS INT) AS branch_code
-        FROM employees
+        FROM employees_master
         WHERE [Emp No.] = CAST(? AS INT)
       `, [cleanUserId]);
 
@@ -5294,30 +5620,40 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
     });
   }
 });
-
 //============================================================================================
 //                                      BRANCH CONTACTS
-//=============================================================================================
+//============================================================================================
+//============================================================================================
+//                                      BRANCH CONTACTS
+//============================================================================================
 app.post("/get-branch-contacts", async (req, res) => {
   try {
-    let { branchCodes } = req.body;
+    let { branchCodes = [], filters = {} } = req.body;
 
-    // --- Ensure branchCodes exists and is an array
-    if (!branchCodes) {
-      console.warn("⚠️ branchCodes missing in request body");
-      return res.json({ data: [] });
-    }
+    const {
+      clusterName,
+      branchCode,
+      branchName,
+      districtName,
+    } = filters;
 
+    // ----------------------------------------------------
+    // Normalize branchCodes → numeric only
+    // ----------------------------------------------------
     if (!Array.isArray(branchCodes)) branchCodes = [branchCodes];
 
-    // --- Convert to numbers and ignore invalid codes
     branchCodes = branchCodes
       .map((c) => {
         if (!c && c !== 0) return null;
 
-        // If object, try to extract possible keys
         if (typeof c === "object") {
-          const keys = ["Branch Code", "BR Code", "Br Code", "branch_code", "Brcode"];
+          const keys = [
+            "Branch Code",
+            "BR Code",
+            "Br Code",
+            "branch_code",
+            "Brcode",
+          ];
           for (const key of keys) {
             if (c[key] !== undefined && c[key] !== null && c[key] !== "") {
               const n = parseInt(c[key], 10);
@@ -5327,49 +5663,107 @@ app.post("/get-branch-contacts", async (req, res) => {
           return null;
         }
 
-        // string or number
         const n = parseInt(c, 10);
         return isNaN(n) ? null : n;
       })
-      .filter(Boolean); // remove invalid / NaN codes
+      .filter((v) => v !== null);
 
-    if (!branchCodes.length) {
-      console.warn("⚠️ No valid branch codes after normalization");
+    // ----------------------------------------------------
+    // BASE QUERY (MASTER TABLE IS AUTHORITATIVE)
+    // ----------------------------------------------------
+    let query = `
+      SELECT
+        bc.[Br Code]         AS branch_code,
+        bcm.cluster_name    AS cluster,
+        bc.[Branch Name]    AS branch_name,
+        bc.[Branch Manager] AS manager,
+        bc.[Contact Number] AS contact_number
+      FROM [MIS].[dbo].[branchContacts] bc
+      INNER JOIN [MIS].[dbo].[Branch_Cluster_Master] bcm
+        ON TRY_CAST(LTRIM(RTRIM(bc.[Br Code])) AS INT)
+         = TRY_CAST(LTRIM(RTRIM(bcm.branch_code)) AS INT)
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    // ----------------------------------------------------
+    // 🔐 FILTER PRIORITY (VERY IMPORTANT)
+    // ----------------------------------------------------
+
+    // 1️⃣ Cluster filter → HIGHEST PRIORITY
+    if (clusterName) {
+      query += ` AND LTRIM(RTRIM(bcm.cluster_name)) = ?`;
+      params.push(clusterName.trim());
+    }
+    // 2️⃣ Only if cluster NOT provided → use branchCodes
+    else if (branchCodes.length) {
+      const placeholders = branchCodes.map(() => "?").join(",");
+      query += `
+        AND TRY_CAST(LTRIM(RTRIM(bc.[Br Code])) AS INT)
+            IN (${placeholders})
+      `;
+      params.push(...branchCodes);
+    }
+    // 3️⃣ Safety fallback
+    else {
       return res.json({ data: [] });
     }
 
-    // --- Prepare query placeholders
-    const placeholders = branchCodes.map(() => "?").join(",");
+    // ----------------------------------------------------
+    // ADDITIONAL FILTERS
+    // ----------------------------------------------------
+    if (branchCode) {
+      query += `
+        AND TRY_CAST(LTRIM(RTRIM(bc.[Br Code])) AS INT)
+            = TRY_CAST(? AS INT)
+      `;
+      params.push(branchCode);
+    }
 
-    const query = `
-      SELECT
-        [Br Code] AS branch_code,
-        [Cluster],
-        [Branch Name] AS branch_name,
-        [Branch Manager] AS manager,
-        [Contact Number] AS contact_number
-      FROM [dbo].[branchContacts]
-      WHERE TRY_CAST([Br Code] AS INT) IN (${placeholders})
-      ORDER BY [Cluster], [Branch Name]
+    if (branchName) {
+      query += `
+        AND LOWER(LTRIM(RTRIM(bc.[Branch Name]))) LIKE ?
+      `;
+      params.push(`%${branchName.trim().toLowerCase()}%`);
+    }
+
+    if (districtName) {
+      query += `
+        AND LOWER(LTRIM(RTRIM(bcm.district))) LIKE ?
+      `;
+      params.push(`%${districtName.trim().toLowerCase()}%`);
+    }
+
+    // ----------------------------------------------------
+    // ORDERING (NUMERIC SAFE)
+    // ----------------------------------------------------
+    query += `
+      ORDER BY TRY_CAST(LTRIM(RTRIM(bc.[Br Code])) AS INT) ASC
     `;
-
+	
+    // ----------------------------------------------------
+    // EXECUTE
+    // ----------------------------------------------------
     let results = [];
     try {
-      results = await queryUTIDatabase(query, branchCodes);
+      results = await queryUTIDatabase(query, params);
     } catch (dbErr) {
       console.error("❌ Database query error:", dbErr.stack || dbErr);
       return res.status(500).json({ error: "Database query failed" });
     }
 
-    // 🚫 DO NOT format these results with formatNumbersDeep()
-    // because it will add commas/decimals to phone numbers.
-    // Just send raw DB output as-is.
+    // ----------------------------------------------------
+    // RETURN RAW DATA
+    // ----------------------------------------------------
     return res.json({ data: results });
+
   } catch (err) {
     console.error("❌ Unexpected error in /get-branch-contacts:", err.stack || err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 
 // ============================================================================================
@@ -5417,6 +5811,12 @@ const clusterTableMap = {
   "accounts opened": "DAOCS",
   npa: "NPACS",
   loans: "LSCS",
+  sma: "SMACS"
+};
+
+const fixedTableUploadMap = {
+  "monthly loan summary": "Monthly_Loan_Summary_Stage",
+  "yearly loan summary": "Yearly_Loan_Summary_Stage",
 };
 
 // BASIC AUTO-MEANING
@@ -5448,6 +5848,8 @@ const SMA_MEANING_OVERRIDES = {
   "SMA 2 Amount": "sma2_amount",
   "Total_ac": "total_accounts",     // required by SP
   "Total_balance": "total_balance", // required by SP
+  "FY SMA 31-03-2025 A/Cs":"sma_fy_accounts",
+  "FY SMA 31-03-2025 Balance":"sma_fy_balance",
 };
 
 // -------- DEPOSITS ACCOUNTS OPENED --------
@@ -5458,6 +5860,9 @@ const DAO_MEANING_OVERRIDES = {
   "TDR (>=1LAKH ) Amount": "tdr_amount",
   "RD Amount": "rd_amount",
   "Savings Amount": "savings_amount",
+  "Current A/Cs": "current_accounts",
+  "Current Amount": "current_amount",
+  Vouchers: "vouchers",
 };
 const DAOCS_MEANING_OVERRIDES = {
   "TDR(>=1 LAKH) A/Cs": "tdr_accounts",
@@ -5466,7 +5871,9 @@ const DAOCS_MEANING_OVERRIDES = {
   "RD Amount": "rd_amount",
   "Savings A/Cs": "savings_accounts",
   "Savings Amount": "savings_amount",
-  Vouchers: "vouchers"
+  "Current A/Cs": "current_accounts",
+  "Current Amount": "current_amount",
+  Vouchers: "vouchers",
 };
 
 // -------- NPACS (Cluster NPA Summary) --------
@@ -5483,6 +5890,8 @@ const NPACS_MEANING_OVERRIDES = {
 
   "downgraded as on date a/cs": "downgraded_npa_accounts",
   "downgraded as on date amount": "downgraded_npa_amount",
+  
+  
 };
 
 // -------- FINAL MEANINGS REQUIRED BY update_daily_summary_from_history --------
@@ -5527,7 +5936,8 @@ const SORTABLE_MEANING_OVERRIDES = {
   deposits_accounts_opened: {
   "TDR (>=1LAKH ) A/Cs": "tdr_accounts",
   "RD A/Cs": "rd_accounts",
-  "Savings A/Cs": "savings_accounts"
+  "Savings A/Cs": "savings_accounts",
+  "Current A/Cs": "current_accounts",
   },
 
   NPA: {
@@ -5584,6 +5994,34 @@ function detectDataType(values) {
 
 function resolveFinalMeaning(label, tableName) {
   const trimmed = label.trim();
+// -------------------------------------------------------------------------
+// ⭐ FY SNAPSHOT — As on 31-03-YYYY (Bank + Cluster + History)
+// -------------------------------------------------------------------------
+const lower = trimmed.toLowerCase();
+
+const isFYEnd =
+  /\b31[-\/]03[-\/]\d{4}\b/.test(lower) ||
+  /\b31[-\/]3[-\/]\d{4}\b/.test(lower);
+
+if (isFYEnd) {
+  // Deposits side (Bank + Cluster)
+  if (
+    tableName === "Deposits" ||
+    tableName === "Deposits_history" ||
+    tableName === "DCS"
+  ) {
+    return "as_on_fy_deposits";
+  }
+
+  // Advances side (Bank + Cluster)
+  if (
+    tableName === "Advances" ||
+    tableName === "Advances_history" ||
+    tableName === "ACS"
+  ) {
+    return "as_on_fy_advances";
+  }
+}
 
   // -------------------------------------------------------------------------
   // 1️⃣ STRICT — meanings required by update_daily_summary_from_history
@@ -5599,6 +6037,30 @@ function resolveFinalMeaning(label, tableName) {
   if (tableName === "SMA" && SMA_MEANING_OVERRIDES[trimmed]) {
     return SMA_MEANING_OVERRIDES[trimmed];
   }
+  // ⭐ SMA FY COLUMNS (Year-end snapshot)
+if (tableName === "SMA") {
+  const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+
+  // detect FY date like 31-03-2025
+  const isFYDate =
+    lower.includes("fy") ||
+    lower.includes("31-03") ||
+    lower.includes("31/03");
+
+  if (isFYDate) {
+    if (lower.includes("a/c")) return "sma_fy_accounts";
+    if (lower.includes("balance") || lower.includes("amount"))
+      return "sma_fy_balance";
+  }
+}
+
+if (tableName === "Deposits" && trimmed === "Branch Code") {
+  return "branch_code";
+}
+
+if (tableName === "Advances" && trimmed === "Branch Code") {
+  return "branch_code";
+}
 
  // -------------------------------------------------------------------------
 // 3️⃣ STRICT Deposits Accounts Opened & DAOCS mappings
@@ -5648,6 +6110,39 @@ if (tableName === "LSCS") {
   }
 }
 
+// -------------------------------------------------------------------------
+// ⭐ CLUSTER SUMMARY — DCS (Deposits Cluster Summary)
+// -------------------------------------------------------------------------
+if (tableName === "DCS") {
+  const dcsMap = {
+    "As on Date": "as_on_date",
+    "Change over PD": "change_over_pd_deposits",
+    "GDM": "gdm_deposits",
+    "GUM": "gum_deposits",
+    "Budget Achieved %": "budget_achieved_deposits",
+  };
+
+  if (dcsMap[trimmed]) {
+    return dcsMap[trimmed];
+  }
+}
+
+// -------------------------------------------------------------------------
+// ⭐ CLUSTER SUMMARY — ACS (Advances Cluster Summary)
+// -------------------------------------------------------------------------
+if (tableName === "ACS") {
+  const acsMap = {
+    "As on Date": "as_on_date",
+    "Change over PD": "change_over_pd_advances",
+    "GDM": "gdm_advances",
+    "GUM": "gum_advances",
+    "Budget Achieved %": "budget_achieved_advances",
+  };
+
+  if (acsMap[trimmed]) {
+    return acsMap[trimmed];
+  }
+}
 
 
 // -------------------------------------------------------------------------
@@ -5676,6 +6171,17 @@ if (tableName === "NPACS") {
       return "unstamped_npa_prev_balance";
     }
   }
+// -------------------------------
+// ⭐ 1️⃣ MONTHLY SNAPSHOT COLUMNS (AS ON <DATE>)
+// -------------------------------
+if (hasDate && lower.startsWith("as on")) {
+  if (lower.includes("a/c")) {
+    return "npa_monthly_accounts";
+  }
+  if (lower.includes("balance")) {
+    return "npa_monthly_balance";
+  }
+}
 
   // -------------------------------
   // ⭐ 2. AS ON DATE COLUMNS
@@ -5708,6 +6214,37 @@ if (tableName === "NPACS") {
   }
 }
 
+// ⭐ NPA — DATE-BASED COLUMNS
+if (tableName === "NPA") {
+  const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+  const hasDate = /\b\d{1,2}[-\/\s\.]\d{1,2}[-\/\s\.]\d{2,4}\b/.test(lower);
+
+  // YEAR-END (31/03/yyyy)
+  if (hasDate && lower.includes("31/03")) {
+    if (lower.includes("stamped npa") && lower.includes("a/c")) {
+      return "stamped_npa_prev_accounts";
+    }
+    if (lower.includes("stamped npa") && lower.includes("balance")) {
+      return "stamped_npa_prev_balance";
+    }
+    if (lower.includes("unstamped") && lower.includes("a/c")) {
+      return "unstamped_npa_prev_accounts";
+    }
+    if (lower.includes("unstamped") && lower.includes("balance")) {
+      return "unstamped_npa_prev_balance";
+    }
+  }
+
+  // MONTHLY SNAPSHOT
+  if (hasDate && lower.startsWith("as on")) {
+    if (lower.includes("a/c")) {
+      return "npa_monthly_accounts";
+    }
+    if (lower.includes("balance")) {
+      return "npa_monthly_balance";
+    }
+  }
+}
 
   // -------------------------------------------------------------------------
   // 4️⃣ Sortable overrides (numeric columns used in sorting)
@@ -5749,23 +6286,92 @@ app.post("/upload-mis", upload.single("file"), async (req, res) => {
   if (!req.file)
     return res.status(400).json({ message: "No file uploaded" });
 
-  let tableName;
+let tableName;
+const normalizedSection = section?.toLowerCase().trim();
 
-if (section) {
-  const normalized = section.toLowerCase().trim();
-  tableName = sectionTableMap[normalized];
+// 1️⃣ FIXED STRUCTURE TABLES (Monthly / Yearly Loan Summary)
+if (normalizedSection && fixedTableUploadMap[normalizedSection]) {
+  tableName = fixedTableUploadMap[normalizedSection];
 }
 
+// 2️⃣ NORMAL MIS SECTIONS
+else if (normalizedSection && sectionTableMap[normalizedSection]) {
+  tableName = sectionTableMap[normalizedSection];
+}
+
+// 3️⃣ CLUSTER SECTIONS
 else if (clusterSection) {
   const normalizedCluster = clusterSection.toLowerCase().trim();
   tableName = clusterTableMap[normalizedCluster];
 }
 
+// 4️⃣ FINAL VALIDATION
+if (!tableName) {
+  return res.status(400).json({ message: "Invalid section" });
+}
 
-  if (!tableName)
-    return res.status(400).json({ message: "Invalid section" });
 
   const historyTable = `${tableName}_history`;
+// ==========================================================================================
+// ⭐ FIXED STRUCTURE LOAN SUMMARY TABLES (DIRECT COLUMN INSERT)
+// ==========================================================================================
+if (fixedTableUploadMap[section?.toLowerCase()]) {
+  const tableName = fixedTableUploadMap[section.toLowerCase()];
+
+  try {
+    const ext = req.file.originalname.toLowerCase();
+    const fileContent = fs.readFileSync(req.file.path);
+
+    const workbook = XLSX.read(
+      ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
+      { type: ext.endsWith(".csv") ? "string" : "buffer" }
+    );
+
+    const rows = XLSX.utils.sheet_to_json(
+      workbook.Sheets[workbook.SheetNames[0]]
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({ message: "File empty" });
+    }
+
+    const fileCols = Object.keys(rows[0]); // EXACT headers
+
+    // 1️⃣ Clear stage table (snapshot table)
+    await queryUTIDatabase(`DELETE FROM [${tableName}]`);
+
+    // 2️⃣ Insert rows directly
+    for (const row of rows) {
+      const cols = fileCols.map(c => `[${c}]`).join(", ");
+      const placeholders = fileCols.map(() => "?").join(", ");
+      const values = fileCols.map(c => row[c] ?? null);
+
+      await queryUTIDatabase(
+        `INSERT INTO [${tableName}] (${cols}) VALUES (${placeholders})`,
+        values
+      );
+    }
+
+    await logActivity(
+      userId,
+      role,
+      "Upload MIS Report",
+      `Uploaded ${rows.length} rows → ${tableName}`
+    );
+
+    return res.json({
+      success: true,
+      message: `${tableName} uploaded successfully`,
+      uploaded: rows.length,
+    });
+  } catch (err) {
+    console.error("❌ Fixed table upload failed:", err);
+    return res.status(500).json({
+      message: "Error uploading loan summary",
+      error: err.message,
+    });
+  }
+}
 
   // ==========================================================================================
   // SPECIAL CASE: LoansAccountsOpened (real columns, NOT col1..col30)
@@ -5852,6 +6458,72 @@ else if (clusterSection) {
       });
     }
   }
+
+
+	// ==========================================================================================
+// SPECIAL CASE: SMACS (REAL COLUMNS, HISTORY APPEND MODE)
+// ==========================================================================================
+if (tableName === "SMACS") {
+  try {
+    const ext = req.file.originalname.toLowerCase();
+    const fileContent = fs.readFileSync(req.file.path);
+
+    const workbook = XLSX.read(
+      ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
+      { type: ext.endsWith(".csv") ? "string" : "buffer" }
+    );
+
+    let rows = XLSX.utils.sheet_to_json(
+      workbook.Sheets[workbook.SheetNames[0]]
+    );
+
+    if (!rows.length)
+      return res.status(400).json({ message: "File empty" });
+
+    const fileCols = Object.keys(rows[0]); // exact headers
+
+    // 1️⃣ Clear ONLY SMACS (latest snapshot)
+    await queryUTIDatabase(`DELETE FROM [SMACS]`);
+
+    // 2️⃣ Insert rows
+    for (const row of rows) {
+      const cols = fileCols.map(c => `[${c}]`).join(", ");
+      const placeholders = fileCols.map(() => "?").join(", ");
+      const values = fileCols.map(c => row[c] ?? null);
+
+      // Insert into SMACS (latest)
+      await queryUTIDatabase(
+        `INSERT INTO [SMACS] (${cols}) VALUES (${placeholders})`,
+        values
+      );
+
+      // Insert into SMACS_history (append, audit-safe)
+      await queryUTIDatabase(
+        `INSERT INTO [SMACS_history] (${cols}) VALUES (${placeholders})`,
+        values
+      );
+    }
+
+    await logActivity(
+      userId,
+      role,
+      "Upload MIS Report",
+      `Uploaded ${rows.length} rows → SMACS (history appended)`
+    );
+
+    return res.json({
+      success: true,
+      message: "SMACS uploaded successfully (history preserved)",
+      uploaded: rows.length,
+    });
+  } catch (err) {
+    console.error("❌ Upload SMACS failed:", err);
+    return res.status(500).json({
+      message: "Error uploading SMACS",
+      error: err.message,
+    });
+  }
+}
 
   // ==========================================================================================
   // DEFAULT MODE: col1..col30 (Deposits, Advances, NPA, SMA, deposits_accounts_opened, etc.)
@@ -6059,7 +6731,6 @@ const tableName = sectionTableMap[normalized] || section;
 });
 
 
-
  //=================================================
  //           Business date
  //=================================================
@@ -6142,7 +6813,7 @@ app.post("/get-activity-logs", async (req, res) => {
     let sql = `
       SELECT a.*, e.[Emp No.] AS emp_no, e.[Employee Name] AS emp_name
       FROM [dbo].[activity_logs] a
-      LEFT JOIN [dbo].[employees] e 
+      LEFT JOIN [dbo].[employees_master] e 
         ON a.user_id = e.[Emp No.]  -- 🔥 FIX HERE
       WHERE 1=1
     `;
@@ -6249,7 +6920,7 @@ app.post("/get-last-activities", async (req, res) => {
         FROM [dbo].[activity_logs]
         GROUP BY user_id
       ) a2 ON a1.user_id = a2.user_id AND a1.created_at = a2.max_date
-      JOIN [dbo].[employees] e ON a1.user_id = e.[Emp No.]
+      JOIN [dbo].[employees_master] e ON a1.user_id = e.[Emp No.]
       WHERE 1=1
     `;
 
@@ -6266,6 +6937,446 @@ app.post("/get-last-activities", async (req, res) => {
   } catch (err) {
     console.error("❌ Error fetching last activities:", err);
     res.status(500).json({ message: "Server error while fetching last activities" });
+  }
+});
+
+//============================================================================
+//                              AT A GLANCE – MAIN
+//============================================================================
+app.post("/api/glance", async (req, res) => {
+  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const resolved = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+	  cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), resolved.level);
+    request.input("branch_code", sql.Int, resolved.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), resolved.branch_name ?? null);
+    request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  resolved.level === "CLUSTER" ? resolved.cluster_name : null
+);
+
+
+    const result = await request.execute("get_glance_data");
+
+    res.json({
+      success: true,
+      resolvedLevel: resolved.level,
+      data: {
+        card1: result.recordsets?.[0]?.[0] ?? null,
+        card2: result.recordsets?.[1]?.[0] ?? null,
+        card3: result.recordsets?.[2]?.[0] ?? null,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+});
+
+
+//======================================================
+//                NPA – AT A GLANCE (SECURE)
+//======================================================
+app.post("/api/glance/npa", async (req, res) => {
+  const { level, branch_code, branch_name, cluster_name,userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+	  cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  r.level === "CLUSTER" ? r.cluster_name : null
+);
+
+
+    const result = await request.execute("get_glance_npa_data");
+
+    res.json({ success: true, data: result.recordset || [] });
+  } catch (err) {
+    res.status(500).json({ success: false });
+  }
+});
+
+
+// ===============================
+// SMA – AT A GLANCE (SECURE)
+// ===============================
+app.post("/api/glance/sma", async (req, res) => {
+  const { level, branch_code, branch_name, cluster_name,userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+	  cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  r.level === "CLUSTER" ? r.cluster_name : null
+);
+
+    const result = await request.execute("get_glance_sma_data");
+
+    res.json({ success: true, data: result.recordset || [] });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+});
+
+
+// ===============================
+// DOA – AT A GLANCE (CARD 4) – FINAL & STABLE
+// ===============================
+app.post("/api/glance/doa-card4", async (req, res) => {
+  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+	  cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
+   request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  r.level === "CLUSTER" ? r.cluster_name : null
+);
+
+
+    const result = await request.execute("get_glance_doa_card4");
+
+    const rows = result.recordsets
+      ? result.recordsets.flat()
+      : result.recordset || [];
+
+    // 🔁 RESHAPE FOR UI (UNCHANGED LOGIC)
+    const data = {
+      TDR: { type: "TDR" },
+      RD: { type: "RD" },
+      Savings: { type: "Savings" },
+      Current: { type: "Current" },
+    };
+
+    rows.forEach((r) => {
+      if (r.section === "As on Date") {
+        data.TDR.on_acs = r.tdr_acs;
+        data.TDR.on_amt = r.tdr_amt;
+        data.RD.on_acs = r.rd_acs;
+        data.RD.on_amt = r.rd_amt;
+        data.Savings.on_acs = r.sb_acs;
+        data.Savings.on_amt = r.sb_amt;
+        data.Current.on_acs = r.ca_acs;
+        data.Current.on_amt = r.ca_amt;
+      }
+
+      if (r.section === "Month To Date") {
+        data.TDR.mtd_acs = r.tdr_acs;
+        data.TDR.mtd_amt = r.tdr_amt;
+        data.RD.mtd_acs = r.rd_acs;
+        data.RD.mtd_amt = r.rd_amt;
+        data.Savings.mtd_acs = r.sb_acs;
+        data.Savings.mtd_amt = r.sb_amt;
+        data.Current.mtd_acs = r.ca_acs;
+        data.Current.mtd_amt = r.ca_amt;
+      }
+
+      if (r.section === "Previous Year") {
+        data.TDR.ytd_acs = r.tdr_acs;
+        data.TDR.ytd_amt = r.tdr_amt;
+        data.RD.ytd_acs = r.rd_acs;
+        data.RD.ytd_amt = r.rd_amt;
+        data.Savings.ytd_acs = r.sb_acs;
+        data.Savings.ytd_amt = r.sb_amt;
+        data.Current.ytd_acs = r.ca_acs;
+        data.Current.ytd_amt = r.ca_amt;
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: Object.values(data),
+    });
+
+  } catch (err) {
+    console.error("❌ DOA Card4 API error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch DOA Card 4 data",
+    });
+  }
+});
+
+
+
+// ===============================
+// CARD 5 – LOANS OPENED (SECURE, FINAL)
+// ===============================
+app.post("/api/glance/loans-opened", async (req, res) => {
+  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+	  cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
+    request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  r.level === "CLUSTER" ? r.cluster_name : null
+);
+
+
+    const result = await request.execute("get_glance_loans_card5");
+
+    res.json({ success: true, rows: result.recordset || [] });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+});
+
+// ===============================
+// EMPLOYEE EFFICIENCY – CARD 6
+// ===============================
+app.post("/api/glance/employee-efficiency", async (req, res) => {
+  const { level, branch_code, branch_name, cluster_name, userLevel } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+    });
+
+    const request = pool.request();
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    // 🔴 IMPORTANT: CORRECT PROCEDURE NAME
+    const result = await request.execute(
+      "get_glance_employee_efficiency"
+    );
+
+    res.json({
+      success: true,
+      data: result.recordset?.[0] || null,
+    });
+  } catch (err) {
+    console.error("❌ Employee Efficiency API error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+// ===============================
+// BUSINESS CORRESPONDENTS – CARD 1 (REUSABLE)
+// ===============================
+app.post("/api/glance/business-correspondents", async (req, res) => {
+  const { level, branch_code, branch_name, cluster_name } = req.body;
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), level);
+    request.input("branch_code", sql.Int, branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      level === "CLUSTER" ? cluster_name : null
+    );
+
+    const result = await request.execute(
+      "get_glance_business_correspondents"
+    );
+
+    res.json({
+      success: true,
+      data: result.recordset?.[0] || null,
+    });
+  } catch (err) {
+    console.error("❌ BC API error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// ===============================
+// ATMs – CARD 1 (REUSABLE)
+// ===============================
+app.post("/api/glance/atms", async (req, res) => {
+  const { level, branch_code, branch_name, cluster_name } = req.body;
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), level);
+    request.input("branch_code", sql.Int, branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      level === "CLUSTER" ? cluster_name : null
+    );
+
+    const result = await request.execute("get_glance_atms");
+
+    res.json({
+      success: true,
+      data: result.recordset?.[0] || null,
+    });
+  } catch (err) {
+    console.error("❌ ATM API error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+// ================================================
+// 🔐 VALIDATE BRANCH ↔ CLUSTER (LEVEL 2 SECURITY)
+// ================================================
+app.post("/api/validate-branch-cluster", async (req, res) => {
+  const { branch_code, branch_name, cluster_name } = req.body;
+
+  if (!cluster_name || (branch_code == null && !branch_name)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid input",
+    });
+  }
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    let query = `
+      SELECT COUNT(*) AS cnt
+      FROM Branch_Cluster_Master
+      WHERE cluster_name = @cluster_name
+    `;
+
+    request.input("cluster_name", sql.VarChar(50), cluster_name);
+
+    if (branch_code !== null && branch_code !== undefined) {
+      query += " AND branch_code = @branch_code";
+      request.input("branch_code", sql.Int, branch_code);
+    } else {
+      query += " AND branch_name = @branch_name";
+      request.input("branch_name", sql.VarChar(100), branch_name);
+    }
+
+    const result = await request.query(query);
+    const count = result.recordset[0].cnt;
+
+if (count === 0) {
+  return res.status(403).json({
+    success: false,
+    message: "Branch does not belong to your cluster",
+  });
+}
+
+return res.json({ success: true });
+  } catch (err) {
+    console.error("❌ validate-branch-cluster error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
+  }
+});
+app.post("/get-branches-by-cluster", async (req, res) => {
+  const { cluster_name } = req.body;
+
+  if (!cluster_name) {
+    return res.status(400).json({
+      success: false,
+      message: "cluster_name required",
+    });
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const result = await pool
+      .request()
+      .input("cluster", sql.VarChar(50), cluster_name)
+      .query(`
+        SELECT branch_code, branch_name
+        FROM Branch_Cluster_Master
+        WHERE cluster_name = @cluster
+        ORDER BY branch_name
+      `);
+
+    return res.json({
+      success: true,
+      branches: result.recordset,
+    });
+  } catch (err) {
+    console.error("❌ get-branches-by-cluster error", err);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
   }
 });
 
