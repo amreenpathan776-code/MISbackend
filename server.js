@@ -6037,6 +6037,27 @@ if (isFYEnd) {
   if (tableName === "SMA" && SMA_MEANING_OVERRIDES[trimmed]) {
     return SMA_MEANING_OVERRIDES[trimmed];
   }
+  // -------------------------------------------------------------------------
+// ⭐ SMA — MONTHLY SNAPSHOT (AS ON <DATE>)
+// -------------------------------------------------------------------------
+if (tableName === "SMA") {
+  const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+
+  // detect any date like 31-12-2025 / 31/12/2025 / 31 12 2025
+  const hasDate =
+    /\b\d{1,2}[-\/\s\.]\d{1,2}[-\/\s\.]\d{2,4}\b/.test(lower);
+
+  // must start with "as on"
+  if (hasDate && lower.startsWith("as on")) {
+    if (lower.includes("a/c")) {
+      return "sma_monthly_accounts";
+    }
+    if (lower.includes("amount") || lower.includes("balance")) {
+      return "sma_monthly_balance";
+    }
+  }
+}
+
   // ⭐ SMA FY COLUMNS (Year-end snapshot)
 if (tableName === "SMA") {
   const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
@@ -6060,6 +6081,75 @@ if (tableName === "Deposits" && trimmed === "Branch Code") {
 
 if (tableName === "Advances" && trimmed === "Branch Code") {
   return "branch_code";
+}
+// -------------------------------------------------------------------------
+// ⭐ SMACS — COMPLETE MEANING RESOLUTION (CLUSTER SMA SUMMARY)
+// -------------------------------------------------------------------------
+if (tableName === "SMACS") {
+  const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+
+  // -------------------------------
+  // 1️⃣ BASIC IDENTIFIERS
+  // -------------------------------
+  if (lower === "cluster") return "cluster";
+  if (lower === "district") return "district";
+
+  // -------------------------------
+  // 2️⃣ SMA CATEGORY COUNTS
+  // -------------------------------
+  if (lower === "sma 0 a/cs") return "sma0_accounts";
+  if (lower === "sma 0 amount") return "sma0_amount";
+
+  if (lower === "sma 1 a/cs") return "sma1_accounts";
+  if (lower === "sma 1 amount") return "sma1_amount";
+
+  if (lower === "sma 2 a/cs") return "sma2_accounts";
+  if (lower === "sma 2 amount") return "sma2_amount";
+
+  // -------------------------------
+  // 3️⃣ TOTALS
+  // -------------------------------
+  if (lower === "total_ac" || lower === "total a/cs")
+    return "total_accounts";
+
+  if (lower === "total_balance" || lower === "total amount")
+    return "total_balance";
+
+  // -------------------------------
+  // 4️⃣ FY SNAPSHOT (31-03-YYYY)
+  // -------------------------------
+  const isFY =
+    lower.includes("fy") ||
+    lower.includes("31-03") ||
+    lower.includes("31/03");
+
+  if (isFY) {
+    if (lower.includes("a/c")) return "sma_fy_accounts";
+    if (lower.includes("balance") || lower.includes("amount"))
+      return "sma_fy_balance";
+  }
+
+  // -------------------------------
+  // 5️⃣ MONTHLY SNAPSHOT (AS ON <DATE>)
+  // -------------------------------
+  const hasDate =
+    /\b\d{1,2}[-\/\s\.]\d{1,2}[-\/\s\.]\d{2,4}\b/.test(lower);
+
+  if (hasDate && lower.startsWith("as on")) {
+    if (lower.includes("a/c")) return "sma_monthly_accounts";
+
+    if (
+      lower.includes("amount") ||
+      lower.includes("amonut") || // typo-safe
+      lower.includes("balance")
+    )
+      return "sma_monthly_balance";
+  }
+
+  // -------------------------------
+  // 6️⃣ NO MATCH
+  // -------------------------------
+  return null;
 }
 
  // -------------------------------------------------------------------------
@@ -6460,70 +6550,6 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
   }
 
 
-	// ==========================================================================================
-// SPECIAL CASE: SMACS (REAL COLUMNS, HISTORY APPEND MODE)
-// ==========================================================================================
-if (tableName === "SMACS") {
-  try {
-    const ext = req.file.originalname.toLowerCase();
-    const fileContent = fs.readFileSync(req.file.path);
-
-    const workbook = XLSX.read(
-      ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
-      { type: ext.endsWith(".csv") ? "string" : "buffer" }
-    );
-
-    let rows = XLSX.utils.sheet_to_json(
-      workbook.Sheets[workbook.SheetNames[0]]
-    );
-
-    if (!rows.length)
-      return res.status(400).json({ message: "File empty" });
-
-    const fileCols = Object.keys(rows[0]); // exact headers
-
-    // 1️⃣ Clear ONLY SMACS (latest snapshot)
-    await queryUTIDatabase(`DELETE FROM [SMACS]`);
-
-    // 2️⃣ Insert rows
-    for (const row of rows) {
-      const cols = fileCols.map(c => `[${c}]`).join(", ");
-      const placeholders = fileCols.map(() => "?").join(", ");
-      const values = fileCols.map(c => row[c] ?? null);
-
-      // Insert into SMACS (latest)
-      await queryUTIDatabase(
-        `INSERT INTO [SMACS] (${cols}) VALUES (${placeholders})`,
-        values
-      );
-
-      // Insert into SMACS_history (append, audit-safe)
-      await queryUTIDatabase(
-        `INSERT INTO [SMACS_history] (${cols}) VALUES (${placeholders})`,
-        values
-      );
-    }
-
-    await logActivity(
-      userId,
-      role,
-      "Upload MIS Report",
-      `Uploaded ${rows.length} rows → SMACS (history appended)`
-    );
-
-    return res.json({
-      success: true,
-      message: "SMACS uploaded successfully (history preserved)",
-      uploaded: rows.length,
-    });
-  } catch (err) {
-    console.error("❌ Upload SMACS failed:", err);
-    return res.status(500).json({
-      message: "Error uploading SMACS",
-      error: err.message,
-    });
-  }
-}
 
   // ==========================================================================================
   // DEFAULT MODE: col1..col30 (Deposits, Advances, NPA, SMA, deposits_accounts_opened, etc.)
