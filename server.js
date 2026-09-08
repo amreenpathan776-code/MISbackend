@@ -1,3 +1,8 @@
+require('dotenv').config(); 
+const jwt = require('jsonwebtoken');
+const authMiddleware = require('./authMiddleware');
+const dashboardAuthMiddleware =
+  require("./dashboardAuthMiddleware");
 const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
@@ -14,14 +19,17 @@ const sql = require("mssql");
 const { formatNumbersDeep } = require("./formatter");
 const { formatWithMeanings } = require("./formatter");
 const https = require("https");
+const { fileTypeFromBuffer } = require("file-type");
+const rateLimit = require("express-rate-limit");
+
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT ;
 
 const httpsOptions = {
-  key: fs.readFileSync("C:/ssl/coastal.bank.in.key"),
-  cert: fs.readFileSync("C:/ssl/coastal.bank.in.crt"),
-  ca: fs.readFileSync("C:/ssl/ca_bundle.crt")
+  key: fs.readFileSync(process.env.SSL_KEY),
+  cert: fs.readFileSync(process.env.SSL_CERT),
+  ca: fs.readFileSync(process.env.SSL_CA)
 };
 
 // LAN IP
@@ -34,8 +42,65 @@ app.set("BASE_URL", BASE_URL);
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
+;
+app.use((req, res, next) => {
 
+  if (
+    req.url !== "/dashboard-session-check"
+  ) {
+    console.log(
+      "🔥 API HIT:",
+      req.url
+    );
+  }
 
+  next();
+
+});
+
+const writeDailyLog = require("./logger");
+
+function formatMessage(args) {
+  return args.map(a =>
+    typeof a === "object"
+      ? JSON.stringify(a)
+      : a
+  ).join(" ");
+}
+
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+
+console.log = (...args) => {
+
+  writeDailyLog(
+    "backend",
+    formatMessage(args)
+  );
+
+  originalLog(...args);
+};
+
+console.warn = (...args) => {
+
+  writeDailyLog(
+    "backend",
+    formatMessage(args)
+  );
+
+  originalWarn(...args);
+};
+
+console.error = (...args) => {
+
+  writeDailyLog(
+    "backend",
+    formatMessage(args)
+  );
+
+  originalError(...args);
+};
 // ===========================================================
 // 🪄 Global middleware to format all numeric values in Indian style (safe version)
 // ===========================================================
@@ -73,10 +138,10 @@ app.use((req, res, next) => {
 
 //========================= MSSQL (Local/UIT Server) Connection =========================//
 const mssqlConfig = {
-  user: "AdministratorDev",
-  password: "Clab@@230830",
-  server: "10.0.0.4",
-  database: "MIS",
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  server: process.env.DB_SERVER,
+  database: process.env.DB_NAME,
   options: {
     encrypt: false,
     trustServerCertificate: true,
@@ -117,18 +182,80 @@ async function queryUTIDatabase(query, params = []) {
   }
 }
 
+// 🔥 UNIVERSAL SAFE STRING NORMALIZER
+const norm = (val) => {
+  if (val === null || val === undefined) return "";
+  return String(val).trim();
+};
 
+// ⭐ UNIVERSAL FILTER NORMALIZER (USE IN ALL APIs)
+const safeTrim = (val) => {
+  if (val === undefined || val === null) return "";
+  return String(val).trim();
+};
+
+const parseFilters = (filters = {}) => {
+  return {
+    branchCode: safeTrim(filters.branchCode ?? filters.branch_code),
+    branchName: safeTrim(filters.branchName ?? filters.branch_name),
+    districtName: safeTrim(filters.districtName ?? filters.district),
+    clusterName: safeTrim(filters.clusterName ?? filters.cluster),
+  };
+};
 
 app.get("/backend", (req, res) => {
   res.send("Backend is working");
 });
 
+// =====================================================
+// RATE LIMITERS
+// =====================================================
+
+// Login protection
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many login attempts. Try again after 15 minutes.",
+  },
+});
+
+// Upload protection
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many uploads. Try again later.",
+  },
+});
+
+// Password reset protection
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many password reset attempts.",
+  },
+});
+
 //========================= MSSQL MISUAT Connection =========================//
 const mssqlConfigMISUAT = {
-  user: "AdministratorDev",
-  password: "Clab@@230830",
-  server: "10.0.0.4",
-  database: "MISUAT",
+  user: process.env.MISUAT_USER,
+  password: process.env.MISUAT_PASSWORD,
+  server: process.env.MISUAT_SERVER,
+  database: process.env.MISUAT_DB,
   options: {
     encrypt: false,
     trustServerCertificate: true,
@@ -191,27 +318,62 @@ function applyLevel1Restriction({
   branch_code,
   branch_name,
   cluster_name,
+  designation,
 }) {
-  // 🔒 Level 1 → ONLY own branch
+
+  // LEVEL 1
   if (userLevel === "Level 1") {
     return {
       level: "BRANCH",
       branch_code,
-      branch_name: branch_code ? null : branch_name,
+      branch_name: null,
       cluster_name: null,
     };
   }
 
-  // ✅ Level 2 & Admin → PRESERVE CLUSTER
+// LEVEL 2
+if (userLevel === "Level 2") {
+
+  let fixedCluster = cluster_name;
+
+  const match =
+    designation?.match(
+      /Cluster\s*Head\s*[-:]\s*(.*)/i
+    );
+
+  if (match?.[1]) {
+    fixedCluster = match[1].trim();
+  }
+
+  // Branch selected
+  if (branch_code || branch_name) {
+    return {
+      level: "BRANCH",
+      branch_code,
+      branch_name,
+      cluster_name: null,
+    };
+  }
+
+  // Cluster view
+  return {
+    level: "CLUSTER",
+    branch_code: null,
+    branch_name: null,
+    cluster_name: fixedCluster,
+  };
+}
+  // LEVEL 3
   return {
     level: requestedLevel,
     branch_code,
     branch_name,
     cluster_name:
-      requestedLevel === "CLUSTER" ? cluster_name : null,
+      requestedLevel === "CLUSTER"
+        ? cluster_name
+        : null,
   };
 }
-
 // ===========================================================
 // ✅ Log Activity Function (Safe for SQL)
 // ===========================================================
@@ -258,6 +420,27 @@ async function logActivity(userId, role, action, details) {
   }
 }
 
+//========================Enumeration Monitoring====================
+async function logSecurityEvent(userId, action, details) {
+  try {
+    await queryUTIDatabase(
+      `
+      INSERT INTO activity_logs
+      (user_id, role, action, details, created_at)
+      VALUES (?, ?, ?, ?, GETDATE())
+      `,
+      [
+        userId || "UNKNOWN",
+        "Security",
+        action,
+        details,
+      ]
+    );
+  } catch (err) {
+    console.error("Security log failed:", err);
+  }
+}
+
 // ===================== NORMALIZE PHONE =====================
 function normalizePhoneOrBranch(input) {
   if (!input) return "";
@@ -281,14 +464,32 @@ function normalizePhoneOrBranch(input) {
 //============================================================================================
 //                                    REGISTER
 //=============================================================================================
-app.post("/register", async (req, res) => {
+app.post("/register", loginLimiter, async (req, res) => {
   const { employeeId, phone, password, securityQuestions, deviceId } = req.body;
-
+console.log(
+  "REGISTER_API_HIT",
+  {
+    employeeId,
+    deviceId
+  }
+);
   if (!employeeId || !phone || !password || !deviceId) {
+console.warn(
+  "REGISTER_MISSING_FIELDS",
+  {
+    employeeId
+  }
+);
     return res.status(400).json({ message: "All fields are required." });
   }
 
   if (!Array.isArray(securityQuestions) || securityQuestions.length !== 3) {
+console.warn(
+  "REGISTER_INVALID_SECURITY_QUESTIONS",
+  {
+    employeeId
+  }
+);
     return res.status(400).json({
       message: "Exactly 3 security questions with answers are required.",
     });
@@ -308,6 +509,22 @@ app.post("/register", async (req, res) => {
     );
 
     if (empRows.length === 0) {
+await logSecurityEvent(
+  employeeId,
+  "Registration Enumeration",
+  JSON.stringify({
+    employeeId,
+    phone: normalizedPhone,
+    reason: "Employee ID or Phone not found"
+  })
+);
+console.warn(
+  "REGISTER_EMPLOYEE_NOT_FOUND",
+  {
+    employeeId,
+    phone: normalizedPhone
+  }
+);
       return res.status(404).json({
         message: "Employee ID or Phone not found.",
       });
@@ -333,6 +550,12 @@ app.post("/register", async (req, res) => {
 
 if (authRows.length === 0) {
   // This should never happen if trigger is working
+console.warn(
+  "REGISTER_AUTH_RECORD_MISSING",
+  {
+    employeeId
+  }
+);
   return res.status(403).json({
     message: "User not enabled for application access. Contact admin."
   });
@@ -350,6 +573,12 @@ const alreadyRegistered =
   auth.security_q3;
 
 if (alreadyRegistered) {
+console.warn(
+  "REGISTER_ALREADY_COMPLETED",
+  {
+    employeeId
+  }
+);
   return res.status(409).json({
     message: "Registration already completed. Contact admin if reset is required."
   });
@@ -368,6 +597,13 @@ if (alreadyRegistered) {
 );
 
 if (deviceRows.length > 0) {
+console.warn(
+  "REGISTER_DEVICE_ALREADY_USED",
+  {
+    employeeId,
+    deviceId
+  }
+);
   return res.status(409).json({
     message: "This device is already registered to another employee.",
   });
@@ -376,15 +612,27 @@ if (deviceRows.length > 0) {
 
     // 4️⃣ Decide Level
     let level = "Level 1";
+
     if (emp.Designation?.includes("Cluster Head")) {
       level = "Level 2";
     } else if (emp["Br Code"] === 9999) {
       level = "Level 3";
     }
-
+console.log(
+  "REGISTER_LEVEL_ASSIGNED",
+  {
+    employeeId,
+    level
+  }
+);
     // 5️⃣ Generate GA
     const secret = speakeasy.generateSecret({ length: 32 });
-
+console.log(
+  "REGISTER_GA_SECRET_GENERATED",
+  {
+    employeeId
+  }
+);
     // 6️⃣ Insert AUTH record
    // 6️⃣ UPDATE AUTH record (CORRECT)
 const result = await queryUTIDatabase(
@@ -416,16 +664,35 @@ const result = await queryUTIDatabase(
     employeeId,
   ]
 );
-
+console.log(
+  "REGISTER_AUTH_RECORD_UPDATED",
+  {
+    employeeId,
+    level
+  }
+);
     logActivity(employeeId, "User", "Register", `Device:${deviceId}`);
-
+console.log(
+  "REGISTER_SUCCESS",
+  {
+    employeeId,
+    level
+  }
+);
     return res.status(200).json({
       message: "Registration successful. Awaiting admin approval.",
       googleAuthKey: secret.base32,
     });
 
   } catch (err) {
-    console.error("❌ /register error:", err);
+ console.error(
+  "REGISTER_FAILED",
+  {
+    employeeId: req.body?.employeeId,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       message: "Server error during registration.",
     });
@@ -436,11 +703,18 @@ const result = await queryUTIDatabase(
 //                                           LOGIN
 //=============================================================================================
 //========================= /login Route =========================//
-app.post("/login", async (req, res) => {
+app.post("/login", loginLimiter, async (req, res) => {
   try {
     const { employeeId, password, deviceId, token } = req.body;
-
+console.log(
+  "LOGIN_API_HIT",
+  {
+    employeeId,
+    deviceId
+  }
+);
     if (!employeeId || !password || !deviceId || !token) {
+
       return res.status(400).json({ message: "All fields are required." });
     }
 
@@ -480,6 +754,21 @@ app.post("/login", async (req, res) => {
         "Login Failed",
         "Employee not found"
       );
+await logSecurityEvent(
+  employeeId,
+  "Login Enumeration",
+  JSON.stringify({
+    employeeId,
+    deviceId,
+    reason: "Employee not found"
+  })
+);
+console.warn(
+  "LOGIN_EMPLOYEE_NOT_FOUND",
+  {
+    employeeId
+  }
+);
       return res.status(404).json({ message: "Employee not found." });
     }
 
@@ -492,11 +781,23 @@ app.post("/login", async (req, res) => {
     ================================================= */
     if (user.account_locked) {
       logActivity(userId, role, "Login Failed", "Account locked");
+console.warn(
+  "LOGIN_ACCOUNT_LOCKED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({ message: "Account locked. Contact admin." });
     }
 
     if (user["Approval status"] !== "approved") {
       logActivity(userId, role, "Login Failed", "Account not approved");
+console.warn(
+  "LOGIN_ACCOUNT_NOT_APPROVED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({
         message: "Account not approved by admin yet.",
       });
@@ -504,6 +805,12 @@ app.post("/login", async (req, res) => {
 
     if (user.reset_required) {
       logActivity(userId, role, "Login Failed", "Password reset required");
+console.warn(
+  "LOGIN_PASSWORD_RESET_REQUIRED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({
         message: "Password reset required before login.",
         forceForgotPassword: true,
@@ -515,7 +822,14 @@ app.post("/login", async (req, res) => {
     ================================================= */
 // ❌ Wrong password
 if (user.Password !== password) {
-  const newAttempts = (user.failed_attempts || 0) + 1;
+ const newAttempts = (user.failed_attempts || 0) + 1;
+console.warn(
+  "LOGIN_INVALID_PASSWORD",
+  {
+    employeeId,
+    attempts: newAttempts
+  }
+);
 
   await queryUTIDatabase(
     `
@@ -564,29 +878,49 @@ if (user.Password !== password) {
 
     if (!verified) {
       logActivity(userId, role, "Login Failed", "Invalid Google Auth code");
+console.warn(
+  "LOGIN_INVALID_GA_TOKEN",
+  {
+    employeeId
+  }
+);
       return res.status(401).json({
         message: "Invalid Google Authenticator code.",
       });
     }
 
     /* =================================================
-       5️⃣ DEVICE BINDING
-    ================================================= */
-    if (!user.device_id) {
-      await queryUTIDatabase(
-        `
-        UPDATE [dbo].[employees_auth]
-        SET device_id = ?
-        WHERE [Emp No.] = ?
-        `,
-        [deviceId, employeeId]
-      );
-    } else if (user.device_id !== deviceId) {
-      logActivity(userId, role, "Login Failed", "Device mismatch");
-      return res.status(403).json({
-        message: "Login denied: Account bound to another device.",
-      });
-    }
+   5️⃣ DEVICE BINDING
+================================================= */
+
+// ✅ Allow testing accounts to login from multiple devices
+const multiDeviceUsers = ["1", "3" , "65"];
+
+if (multiDeviceUsers.includes(String(employeeId))) {
+  console.log(`🧪 Multi-device login allowed for ${employeeId}`);
+}
+else if (!user.device_id) {
+  await queryUTIDatabase(
+    `
+    UPDATE [dbo].[employees_auth]
+    SET device_id = ?
+    WHERE [Emp No.] = ?
+    `,
+    [deviceId, employeeId]
+  );
+}
+else if (user.device_id !== deviceId) {
+  logActivity(userId, role, "Login Failed", "Device mismatch");
+console.warn(
+  "LOGIN_DEVICE_MISMATCH",
+  {
+    employeeId
+  }
+);
+  return res.status(403).json({
+    message: "Login denied: Account bound to another device.",
+  });
+}
 
     /* =================================================
        6️⃣ SUCCESS LOGIN
@@ -606,9 +940,30 @@ if (user.Password !== password) {
       "Login",
       `User ${user["Employee Name"]} logged in`
     );
-
+const jwtToken = jwt.sign(
+  {
+    employeeId: userId,
+    role: role,
+    level: user.Level,
+    branchCode: user["Br Code"],
+    designation: user.Designation
+  },
+  process.env.JWT_SECRET,
+  {
+    expiresIn: '1h'
+  }
+);
+console.log(
+  "LOGIN_SUCCESS",
+  {
+    employeeId,
+    role,
+    level: user.Level
+  }
+);
     return res.status(200).json({
-      success: true,
+  success: true,
+  token: jwtToken,
       message: `Welcome, ${user["Employee Name"]}!`,
       role,
       userId,
@@ -624,7 +979,14 @@ if (user.Password !== password) {
     });
 
   } catch (err) {
-    console.error("❌ /login error:", err);
+   console.error(
+  "LOGIN_FAILED",
+  {
+    employeeId: req.body?.employeeId,
+    error: err.message,
+    stack: err.stack
+  }
+);
 
     logActivity(
       String(req.body?.employeeId || "UNKNOWN"),
@@ -644,20 +1006,44 @@ if (user.Password !== password) {
 //                                          LOGOUT ENDPOINT
 //=============================================================================================
 
-app.post("/logout", async (req, res) => {
-  const { userId, role, lastActivity } = req.body;
+app.post("/logout", authMiddleware, async (req, res) => {
+ const { lastActivity } = req.body;
 
+const userId = req.user.employeeId;
+const role = req.user.role;
+console.log(
+  "LOGOUT_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    lastActivity
+  }
+);
   try {
     await logActivity(
+
       userId,
       role,
       "Logout",
       `Last activity: ${lastActivity || "N/A"}`
     );
-
+console.log(
+  "LOGOUT_SUCCESS",
+  {
+    employeeId: userId,
+    role
+  }
+);
     res.json({ success: true, message: "Logged out successfully" });
   } catch (err) {
-    console.error("❌ Logout error:", err.message);
+   console.error(
+  "LOGOUT_FAILED",
+  {
+    employeeId: userId,
+    role,
+    error: err.message
+  }
+);
     res.status(500).json({ success: false, message: "Logout failed" });
   }
 });
@@ -668,11 +1054,24 @@ app.post("/logout", async (req, res) => {
 
 // ✅ Forgot Password - Step 1: Send back user's stored security questions
 // ✅ Step 1: Forgot Password Start — Fetch Security Questions
-app.post("/forgot-password/start", async (req, res) => {
+app.post("/forgot-password/start", passwordLimiter, async (req, res) => {
   try {
     const { employeeId, phone } = req.body;
-
+console.log(
+  "FORGOT_PASSWORD_START_API_HIT",
+  {
+    employeeId,
+    phone
+  }
+);
     if (!employeeId || !phone) {
+console.warn(
+  "FORGOT_PASSWORD_START_MISSING_INPUT",
+  {
+    employeeId,
+    phone
+  }
+);
       return res
         .status(400)
         .json({ message: "Employee ID and phone are required." });
@@ -694,6 +1093,22 @@ app.post("/forgot-password/start", async (req, res) => {
     const results = await queryUTIDatabase(query, [employeeId, phone]);
 
     if (results.length === 0) {
+console.warn(
+  "FORGOT_PASSWORD_START_EMPLOYEE_NOT_FOUND",
+  {
+    employeeId,
+    phone
+  }
+);
+await logSecurityEvent(
+  employeeId,
+  "Security Question Enumeration",
+  JSON.stringify({
+    employeeId,
+    phone,
+    reason: "Employee not found"
+  })
+);
       return res.status(404).json({ message: "Employee not found" });
     }
 
@@ -720,16 +1135,30 @@ app.post("/forgot-password/start", async (req, res) => {
       { id: "q3", text: questionBank[user.security_q3] },
     ];
 
-    logActivity(
-      employeeId,
-      role,
-      "Forgot Password Start",
-      "Requested security questions"
-    );
-
+  await logActivity(
+  employeeId,
+  role,
+  "Forgot Password Start",
+  "Requested security questions"
+);
+console.log(
+  "FORGOT_PASSWORD_START_SUCCESS",
+  {
+    employeeId,
+    questionsReturned: securityQuestions.length
+  }
+);
     return res.json({ questions: securityQuestions });
 
-  } catch (err) {
+} catch (err) {
+console.error(
+  "FORGOT_PASSWORD_START_FAILED",
+  {
+    employeeId: req.body?.employeeId,
+    error: err.message,
+    stack: err.stack
+  }
+);
     console.error("❌ /forgot-password/start error:", err);
     return res.status(500).json({ message: "Server error" });
   }
@@ -737,10 +1166,16 @@ app.post("/forgot-password/start", async (req, res) => {
 
 
 
-app.post("/verify-security-answers", async (req, res) => {
+app.post("/verify-security-answers", passwordLimiter, async (req, res) => {
   try {
     const { employeeId, phone, answers } = req.body;
-
+console.log(
+  "VERIFY_SECURITY_ANSWERS_API_HIT",
+  {
+    employeeId,
+    phone
+  }
+);
     // -----------------------------
     // 1️⃣ Fetch user
     // -----------------------------
@@ -764,6 +1199,18 @@ app.post("/verify-security-answers", async (req, res) => {
     );
 
     if (!rows.length) {
+console.warn(
+  "VERIFY_SECURITY_ANSWERS_EMPLOYEE_NOT_FOUND",
+  {
+    employeeId,
+    phone
+  }
+);
+await logSecurityEvent(
+  employeeId,
+  "Security Question Enumeration",
+  `Unknown employee verification attempt`
+);
       return res.status(404).json({ message: "Employee not found." });
     }
 
@@ -774,6 +1221,12 @@ app.post("/verify-security-answers", async (req, res) => {
     // 2️⃣ PERMANENT LOCK
     // -----------------------------
     if (user.account_locked) {
+console.warn(
+  "VERIFY_SECURITY_ANSWERS_ACCOUNT_LOCKED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({
         message: "Account locked. Contact admin.",
         permanentLock: true,
@@ -800,6 +1253,13 @@ app.post("/verify-security-answers", async (req, res) => {
     const minutesLeft = lockCheck[0].minutesLeft;
 
     if (minutesLeft > 0) {
+console.warn(
+  "VERIFY_SECURITY_ANSWERS_TEMP_LOCK_ACTIVE",
+  {
+    employeeId,
+    minutesLeft
+  }
+);
       return res.status(403).json({
         message: `Too many attempts. Try again after ${minutesLeft} minutes.`,
         lockActive: true,
@@ -844,8 +1304,19 @@ app.post("/verify-security-answers", async (req, res) => {
         [employeeId]
       );
 
-      logActivity(employeeId, role, "Forgot Password Verified", "Success");
-
+   await logActivity(
+  employeeId,
+  role,
+  "Forgot Password Verified",
+  "Success"
+);
+console.log(
+  "VERIFY_SECURITY_ANSWERS_SUCCESS",
+  {
+    employeeId,
+    correctAnswers: correct
+  }
+);
       return res.json({
         message: "Verification successful. You may reset your password.",
         verified: true,
@@ -878,7 +1349,13 @@ app.post("/verify-security-answers", async (req, res) => {
         `,
         [employeeId]
       );
-
+console.warn(
+  "VERIFY_SECURITY_ANSWERS_TEMP_LOCK_CREATED",
+  {
+    employeeId,
+    attempts: newAttempts
+  }
+);
       return res.status(403).json({
         message: "Too many wrong answers. Try again after 2 minutes.",
         lockActive: true,
@@ -898,13 +1375,25 @@ app.post("/verify-security-answers", async (req, res) => {
         `,
         [employeeId]
       );
-
+console.error(
+  "VERIFY_SECURITY_ANSWERS_PERMANENT_LOCK",
+  {
+    employeeId,
+    attempts: newAttempts
+  }
+);
       return res.status(403).json({
         message: "Account locked. Contact admin.",
         permanentLock: true,
       });
     }
-
+console.warn(
+  "VERIFY_SECURITY_ANSWERS_FAILED",
+  {
+    employeeId,
+    attempts: newAttempts
+  }
+);
     // -----------------------------
     // 9️⃣ ATTEMPTS LEFT
     // -----------------------------
@@ -912,8 +1401,15 @@ app.post("/verify-security-answers", async (req, res) => {
       message: `Wrong answers. Attempts left: ${3 - newAttempts}`,
     });
 
-  } catch (err) {
-    console.error("verify-security-answers error:", err);
+} catch (err) {
+console.error(
+  "VERIFY_SECURITY_ANSWERS_ERROR",
+  {
+    employeeId: req.body?.employeeId,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -922,11 +1418,24 @@ app.post("/verify-security-answers", async (req, res) => {
 
 
 // ✅ Step 3: Reset Password
-app.post("/forgot-password/reset", async (req, res) => {
+app.post("/forgot-password/reset", passwordLimiter, async (req, res) => {
   try {
     const { employeeId, phone, newPassword } = req.body;
-
+console.log(
+  "PASSWORD_RESET_API_HIT",
+  {
+    employeeId,
+    phone
+  }
+);
     if (!employeeId || !phone || !newPassword) {
+console.warn(
+  "PASSWORD_RESET_MISSING_INPUT",
+  {
+    employeeId,
+    phone
+  }
+);
       return res.status(400).json({
         message: "All fields required.",
       });
@@ -948,6 +1457,22 @@ app.post("/forgot-password/reset", async (req, res) => {
     );
 
     if (rows.length === 0) {
+console.warn(
+  "PASSWORD_RESET_EMPLOYEE_NOT_FOUND",
+  {
+    employeeId,
+    phone
+  }
+);
+await logSecurityEvent(
+  employeeId,
+  "Password Reset Enumeration",
+  JSON.stringify({
+    employeeId,
+    phone,
+    reason: "Employee not found"
+  })
+);
       return res.status(404).json({
         message: "Employee not found.",
       });
@@ -958,6 +1483,12 @@ app.post("/forgot-password/reset", async (req, res) => {
 
     // 🔒 Permanent lock
     if (user.account_locked) {
+console.warn(
+  "PASSWORD_RESET_ACCOUNT_LOCKED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({
         message: "Account locked. Please contact admin.",
       });
@@ -965,6 +1496,12 @@ app.post("/forgot-password/reset", async (req, res) => {
 
     // 🔐 Ensure security verification happened
     if (!user.reset_required) {
+console.warn(
+  "PASSWORD_RESET_NOT_AUTHORIZED",
+  {
+    employeeId
+  }
+);
       return res.status(403).json({
         message: "Password reset not authorized. Please verify security answers first.",
       });
@@ -984,19 +1521,31 @@ app.post("/forgot-password/reset", async (req, res) => {
       [newPassword, employeeId]
     );
 
-    logActivity(
-      employeeId,
-      role,
-      "Password Reset",
-      "Password reset successful (device retained)"
-    );
-
+await logActivity(
+  employeeId,
+  role,
+  "Password Reset",
+  "Password reset successful (device retained)"
+);
+console.log(
+  "PASSWORD_RESET_SUCCESS",
+  {
+    employeeId
+  }
+);
     return res.json({
       message: "Password reset successful. You can login from your registered device.",
     });
 
-  } catch (err) {
-    console.error("❌ /forgot-password/reset error:", err);
+} catch (err) {
+console.error(
+  "PASSWORD_RESET_FAILED",
+  {
+    employeeId: req.body?.employeeId,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       message: "Server error",
     });
@@ -1011,15 +1560,44 @@ app.post("/forgot-password/reset", async (req, res) => {
  * POST /circulars
  * Body: { empNo, title, message }
  */
-app.post("/circulars", async (req, res) => {
+app.post("/circulars", loginLimiter, authMiddleware, async (req, res) => {
+
   console.log("📩 Incoming request: /circulars");
 
   try {
-    let empNo = parseInt(String(req.body.empNo).split(".")[0]);  // FIX
+// 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+console.warn(
+  "CIRCULAR_CREATE_ACCESS_DENIED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
+   const empNo = parseInt(req.user.employeeId);
     let title = req.body.title;
     let message = req.body.message;
+console.log(
+  "CIRCULAR_CREATE_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    title
+  }
+);
 
     if (!empNo || !title || !message) {
+console.warn(
+  "CIRCULAR_CREATE_VALIDATION_FAILED",
+  {
+    employeeId: req.user?.employeeId
+  }
+);
       return res.status(400).json({ message: "empNo, title and message required" });
     }
 
@@ -1048,10 +1626,22 @@ app.post("/circulars", async (req, res) => {
       "Create Circular",
       `Title: ${title}`
     ]);
-
+console.log(
+  "CIRCULAR_CREATE_SUCCESS",
+  {
+    employeeId: empNo,
+    title
+  }
+);
     res.json({ ok: true, message: "Circular created successfully" });
   } catch (err) {
-    console.error("❌ Error creating circular:", err);
+  console.error(
+  "CIRCULAR_CREATE_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    error: err.message
+  }
+);
     res.status(500).json({ message: "Error creating circular", error: err.message });
   }
 });
@@ -1061,12 +1651,41 @@ app.post("/circulars", async (req, res) => {
  * POST /circulars/delete
  * Body: { circularId, empNo }
  */
-app.post("/circulars/delete", async (req, res) => {
+app.post("/circulars/delete", loginLimiter, authMiddleware, async (req, res) => {
+console.log(
+  "CIRCULAR_DELETE_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    circularId: req.body.circularId
+  }
+);
   try {
+// 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+console.warn(
+  "CIRCULAR_DELETE_ACCESS_DENIED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
     let circularId = parseInt(req.body.circularId);
-    let empNo = String(req.body.empNo || "").replace(/\.0+$/, "");
+ const empNo = req.user.employeeId;
 
     if (!circularId || !empNo) {
+console.warn(
+  "CIRCULAR_DELETE_VALIDATION_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    circularId
+  }
+);
       return res.status(400).json({ message: "circularId and empNo required" });
     }
 
@@ -1075,6 +1694,13 @@ app.post("/circulars/delete", async (req, res) => {
     const rows = await queryUTIDatabase(checkQuery, [circularId]);
 
     if (!rows.length) {
+console.warn(
+  "CIRCULAR_DELETE_NOT_FOUND",
+  {
+    employeeId: req.user?.employeeId,
+    circularId
+  }
+);
       return res.status(404).json({ message: "Circular not found" });
     }
 
@@ -1091,10 +1717,22 @@ app.post("/circulars/delete", async (req, res) => {
       empNo,
       `Deleted circular ID: ${circularId}`
     ]);
-
+console.log(
+  "CIRCULAR_DELETE_SUCCESS",
+  {
+    employeeId: empNo,
+    circularId
+  }
+);
     return res.json({ success: true, message: "Circular deleted successfully" });
   } catch (err) {
-    console.error("❌ Error deleting circular:", err);
+    console.error(
+  "CIRCULAR_DELETE_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    error: err.message
+  }
+);
     return res.status(500).json({ message: "Error deleting circular", error: err.message });
   }
 });
@@ -1106,12 +1744,24 @@ app.post("/circulars/delete", async (req, res) => {
  * Body: { empNo }
  * Returns only pending (unacknowledged) circulars for an employee
  */
-app.post("/circulars/fetch", async (req, res) => {
-
+app.post("/circulars/fetch", authMiddleware, async (req, res) => {
+console.log(
+  "CIRCULAR_FETCH_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
   try {
-    const { empNo } = req.body;
+    const empNo = req.user.employeeId;
 
     if (!empNo) {
+console.warn(
+  "CIRCULAR_FETCH_VALIDATION_FAILED",
+  {
+    employeeId: req.user?.employeeId
+  }
+);
       return res.status(400).json({ message: "empNo required" });
     }
 	
@@ -1132,9 +1782,28 @@ app.post("/circulars/fetch", async (req, res) => {
     const rows = await queryUTIDatabase(sql, [cleanEmpNo]);
 
     console.log(`✅ ${rows.length} circulars fetched for empNo: ${empNo}`);
+console.log(
+  "CIRCULAR_FETCH_SUCCESS",
+  {
+    employeeId: empNo,
+    circulars: rows.length
+  }
+);
+await logActivity(
+  empNo,
+  req.user.role,
+  "View Circulars",
+  `Fetched ${rows.length} circulars`
+);
     return res.json(rows);
   } catch (err) {
-    console.error("❌ Error fetching circulars:", err);
+    console.error(
+  "CIRCULAR_FETCH_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    error: err.message
+  }
+);
     return res.status(500).json({ message: "Error fetching circulars" });
   }
 });
@@ -1143,11 +1812,25 @@ app.post("/circulars/fetch", async (req, res) => {
  * POST /circulars/acknowledge
  * Body: { circularId, empNo }
  */
-app.post("/circulars/acknowledge", async (req, res) => {
+app.post("/circulars/acknowledge", authMiddleware, async (req, res) => {
   try {
-    const { circularId, empNo } = req.body;
-
+    const empNo = req.user.employeeId;
+	const { circularId } = req.body;
+console.log(
+  "CIRCULAR_ACKNOWLEDGE_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    circularId
+  }
+);
     if (!circularId || !empNo) {
+console.warn(
+  "CIRCULAR_ACKNOWLEDGE_VALIDATION_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    circularId
+  }
+);
       return res.status(400).json({ message: "Missing circularId or empNo" });
     }
 
@@ -1172,11 +1855,30 @@ app.post("/circulars/acknowledge", async (req, res) => {
     `;
 
     await queryUTIDatabase(sql, [cleanCircularId, cleanEmpNo]);
-
+console.log(
+  "CIRCULAR_ACKNOWLEDGE_SUCCESS",
+  {
+    employeeId: empNo,
+    circularId
+  }
+);
+await logActivity(
+  empNo,
+  req.user.role,
+  "Acknowledge Circular",
+  `Circular ID ${circularId}`
+);
     return res.json({ success: true });
 
   } catch (err) {
-    console.error("❌ Error acknowledging circular:", err);
+    console.error(
+  "CIRCULAR_ACKNOWLEDGE_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    circularId,
+    error: err.message
+  }
+);
     return res.status(500).json({ message: "Error acknowledging circular" });
   }
 });
@@ -1187,29 +1889,51 @@ app.post("/circulars/acknowledge", async (req, res) => {
  * Admin endpoint: Returns all circulars with acknowledgement count
  * Body: { adminId }
  */
-app.post("/circulars/history", async (req, res) => {
+app.post("/circulars/history", authMiddleware, async (req, res) => {
+console.log(
+  "CIRCULAR_HISTORY_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
   try {
-    const { empNo } = req.body || {};
+// 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+console.warn(
+  "CIRCULAR_HISTORY_ACCESS_DENIED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
+  const empNo = req.user.employeeId;
+
 	const cleanEmpNo = parseInt(empNo || 0);
 
 
-    const sql = `
-      SELECT
-        c.id,
-        c.title,
-        c.message,
-        c.created_at,
-        c.emp_no,
-        e.[Employee Name] AS uploader_name,
-        (
-          SELECT COUNT(*) 
-          FROM circular_acknowledgements ca 
-          WHERE ca.circular_id = c.id
-        ) AS acknowledged_count
-      FROM circulars c
-      LEFT JOIN employees_master e ON e.[Emp No.] = c.emp_no
-      ORDER BY c.created_at DESC;
-    `;
+ const sql = `
+  SELECT
+    c.id,
+    c.title,
+    c.message,
+    FORMAT(c.created_at,'dd-MM-yyyy hh:mm:ss tt') AS created_at,
+    c.emp_no,
+    e.[Employee Name] AS uploader_name,
+    (
+      SELECT COUNT(*)
+      FROM circular_acknowledgements ca
+      WHERE ca.circular_id = c.id
+    ) AS acknowledged_count
+  FROM circulars c
+  LEFT JOIN employees_master e ON e.[Emp No.] = c.emp_no
+  ORDER BY c.created_at DESC;
+`;
 
     const result = await queryUTIDatabase(sql);
 
@@ -1223,10 +1947,22 @@ app.post("/circulars/history", async (req, res) => {
         `Fetched ${result.length} circulars`,
       ]);
     }
-
+console.log(
+  "CIRCULAR_HISTORY_SUCCESS",
+  {
+    employeeId: cleanEmpNo,
+    records: result.length
+  }
+);
     return res.json(result);
   } catch (err) {
-    console.error("❌ Error fetching circulars history:", err);
+    console.error(
+  "CIRCULAR_HISTORY_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    error: err.message
+  }
+);
     return res.status(500).json({
       message: "Error fetching circular history",
       error: err.message,
@@ -1239,8 +1975,30 @@ app.post("/circulars/history", async (req, res) => {
 // ===========================================================================================================
 //                                            USER STATS
 // ===========================================================================================================
-app.post("/user-stats", async (req, res) => {
+app.post("/user-stats", authMiddleware, async (req, res) => {
   try {
+console.log(
+  "USER_STATS_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
+	  // 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+
+  console.warn(
+    "USER_STATS_ACCESS_DENIED",
+    {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role
+    }
+  );
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
     const query = `
       SELECT
         CAST(SUM(CASE WHEN a.[Approval status] = 'approved' THEN 1 ELSE 0 END) AS INT) AS approved,
@@ -1265,7 +2023,18 @@ app.post("/user-stats", async (req, res) => {
 
     const rows = await queryUTIDatabase(query, []);
     const row = rows[0] || {};
-
+console.log(
+  "USER_STATS_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    approved: Number(row.approved || 0),
+    pending: Number(row.pending || 0),
+    rejected: Number(row.rejected || 0),
+    locked: Number(row.locked || 0),
+    totalRegistered: Number(row.total_registered || 0),
+    notRegistered: Number(row.not_registered || 0)
+  }
+);
     return res.status(200).json({
       approved: Number(row.approved || 0),
       pending: Number(row.pending || 0),
@@ -1276,7 +2045,14 @@ app.post("/user-stats", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error fetching user stats:", err);
+   console.error(
+  "USER_STATS_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
     return res.status(500).json({
       message: "Server error while fetching user stats",
     });
@@ -1288,9 +2064,26 @@ app.post("/user-stats", async (req, res) => {
 // ======================================================================================================
 //                                ✅ Get Users (with pagination & status)
 // ======================================================================================================
-app.post("/get-users", async (req, res) => {
+app.post("/get-users", authMiddleware, async (req, res) => {
   try {
+console.log("GET_USERS_API_HIT", {
+  employeeId: req.user.employeeId,
+  role: req.user.role,
+  body: req.body,
+});
+	  // 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
     const { status = "all", page = 1, limit = 10 } = req.body;
+console.log("GET_USERS_FILTERS", {
+  status,
+  page,
+  limit,
+});
     const offset = (page - 1) * limit;
 
     let whereClause = "";
@@ -1306,6 +2099,8 @@ app.post("/get-users", async (req, res) => {
     } else if (status === "not_registered") {
       whereClause = "WHERE a.[Password] IS NULL";
     }
+
+console.log("GET_USERS_WHERE_CLAUSE", whereClause || "NO_FILTER");
     // status === "all" → no WHERE clause
 
     // 🔢 COUNT QUERY
@@ -1317,7 +2112,9 @@ app.post("/get-users", async (req, res) => {
       ${whereClause};
     `;
 
-    const totalResult = await queryUTIDatabase(countQuery, []);
+  const totalResult = await queryUTIDatabase(countQuery, []);
+
+console.log("GET_USERS_COUNT_RESULT", totalResult);
     const total = totalResult[0]?.total || 0;
 
     // 📄 DATA QUERY
@@ -1340,7 +2137,19 @@ app.post("/get-users", async (req, res) => {
     `;
 
     const results = await queryUTIDatabase(usersQuery, []);
+console.log("GET_USERS_RESULTS_COUNT", results.length);
 
+console.log(
+  "GET_USERS_SAMPLE",
+  results.slice(0, 3)
+);
+console.log("GET_USERS_RESPONSE", {
+  total,
+  page,
+  limit,
+  totalPages: Math.ceil(total / limit),
+  usersReturned: results.length,
+});
     return res.json({
       total,
       page: Number(page),
@@ -1361,9 +2170,24 @@ app.post("/get-users", async (req, res) => {
 // =============================================================================================
 //                                     ✅ Update User Status
 // =============================================================================================
-app.post("/update-user-status", async (req, res) => {
+app.post("/update-user-status", loginLimiter, authMiddleware, async (req, res) => {
   try {
-    let { empNo, status, adminId, adminRole } = req.body;
+console.log("UPDATE_USER_STATUS_API_HIT", {
+  employeeId: req.user.employeeId,
+  role: req.user.role,
+  body: req.body,
+});
+	  // 🔒 ADMIN ONLY
+if (req.user.role !== "admin") {
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
+   let { empNo, status } = req.body;
+
+const adminId = req.user.employeeId;
+const adminRole = req.user.role;
 
     if (!empNo || !status) {
       return res.status(400).json({
@@ -1373,7 +2197,11 @@ app.post("/update-user-status", async (req, res) => {
 
     // Clean employee number (handles commas like 1,011)
     const cleanEmpNo = parseInt(String(empNo).replace(/[, ]/g, ""), 10);
-
+console.log("UPDATE_USER_STATUS_CLEAN_EMP", {
+  original: empNo,
+  cleanEmpNo,
+  status,
+});
     if (isNaN(cleanEmpNo)) {
       return res.status(400).json({
         message: "Invalid Employee Number",
@@ -1387,7 +2215,10 @@ app.post("/update-user-status", async (req, res) => {
         message: "Invalid status value",
       });
     }
-
+console.log("UPDATE_USER_STATUS_DB_UPDATE", {
+  empNo: cleanEmpNo,
+  status,
+});
     // 1️⃣ Update approval status in AUTH table
     await queryUTIDatabase(
       `
@@ -1400,6 +2231,9 @@ app.post("/update-user-status", async (req, res) => {
 
     // 2️⃣ Optional: If rejected, clear auth-sensitive fields
     if (status === "rejected") {
+console.log("UPDATE_USER_STATUS_REJECTED_RESET", {
+  empNo: cleanEmpNo,
+});
       await queryUTIDatabase(
         `
         UPDATE [dbo].[employees_auth]
@@ -1429,7 +2263,11 @@ app.post("/update-user-status", async (req, res) => {
       "Update User Status",
       `Set user ${cleanEmpNo} to ${status}`
     );
-
+console.log("UPDATE_USER_STATUS_SUCCESS", {
+  empNo: cleanEmpNo,
+  status,
+  adminId,
+});
     return res.status(200).json({
       success: true,
       message: `User ${cleanEmpNo} ${status} successfully`,
@@ -1452,9 +2290,23 @@ function cleanNumber(value) {
   return value.toString().replace(/,/g, "").replace(/\.00$/, "").trim();
 }
 
-app.post("/unlock-user", async (req, res) => {
+app.post("/unlock-user", loginLimiter, authMiddleware, async (req, res) => {
   try {
-    let { empNo, adminId, adminRole } = req.body;
+	  console.log("UNLOCK_USER_API_HIT", {
+  employeeId: req.user.employeeId,
+  role: req.user.role,
+  body: req.body,
+});
+	      // 🔒 ADMIN ONLY
+    if (req.user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied"
+      });
+    }
+	 let { empNo } = req.body;
+ const adminId = req.user.employeeId;
+const adminRole = req.user.role;
 
     if (!empNo) {
       return res.status(400).json({
@@ -1465,7 +2317,15 @@ app.post("/unlock-user", async (req, res) => {
 
     const cleanEmpNo = cleanNumber(empNo);
     const cleanAdminId = cleanNumber(adminId);
+console.log("UNLOCK_USER_CLEAN_VALUES", {
+  originalEmpNo: empNo,
+  cleanEmpNo,
+  cleanAdminId,
+});
 
+console.log("UNLOCK_USER_DB_UPDATE", {
+  empNo: cleanEmpNo,
+});
     // 1️⃣ Unlock user in AUTH table
     await queryUTIDatabase(
       `
@@ -1481,7 +2341,9 @@ app.post("/unlock-user", async (req, res) => {
       `,
       [cleanEmpNo]
     );
-
+console.log("UNLOCK_USER_DB_UPDATE_SUCCESS", {
+  empNo: cleanEmpNo,
+});
     // 2️⃣ Log admin action (never block main flow)
     try {
       logActivity(
@@ -1493,7 +2355,10 @@ app.post("/unlock-user", async (req, res) => {
     } catch (logErr) {
       console.error("⚠ logActivity failed:", logErr);
     }
-
+console.log("UNLOCK_USER_SUCCESS_RESPONSE", {
+  empNo: cleanEmpNo,
+  adminId: cleanAdminId,
+});
     return res.json({
       success: true,
       message: "User unlocked successfully",
@@ -1501,10 +2366,11 @@ app.post("/unlock-user", async (req, res) => {
 
   } catch (err) {
     console.error("❌ Unlock user error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Server error while unlocking user",
-    });
+ return res.status(500).json({
+  success: false,
+  message: "Server error while unlocking user",
+  error: err.message
+});
   }
 });
 
@@ -1512,10 +2378,20 @@ app.post("/unlock-user", async (req, res) => {
 //          FETCH DISTINCT DISTRICTS & CLUSTERS (Mapping-based, NOT Hardcoded)
 //---------------------------------------------------------------------------------------------
 
-app.post("/get-districts-clusters", async (req, res) => {
+app.post("/get-districts-clusters", authMiddleware , async (req, res) => {
   try {
-    const { level, designation } = req.body;
-
+const level = req.user.level;
+const designation = req.user.designation;
+const userId = req.user.employeeId;
+const role = req.user.role;
+console.log(
+  "GET_DISTRICTS_CLUSTERS_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
     const section = "Deposits";   // ALWAYS safe source
     console.log("🔍 Loading districts/clusters from section:", section);
 
@@ -1556,6 +2432,13 @@ app.post("/get-districts-clusters", async (req, res) => {
 
     if (level === "Level 2" && designation?.includes("Cluster Head-")) {
       effectiveCluster = designation.replace("Cluster Head-", "").trim();
+console.log(
+  "GET_DISTRICTS_CLUSTERS_LEVEL2_RESTRICTION",
+  {
+    employeeId: userId,
+    cluster: effectiveCluster
+  }
+);
 
       baseDistrictQuery += ` AND LTRIM(RTRIM([${clusterCol}])) = ?`;
       baseClusterQuery  += ` AND LTRIM(RTRIM([${clusterCol}])) = ?`;
@@ -1566,7 +2449,14 @@ app.post("/get-districts-clusters", async (req, res) => {
     // 4️⃣ Execute Queries
     const districtsRaw = await queryUTIDatabase(baseDistrictQuery, params);
     const clustersRaw  = await queryUTIDatabase(baseClusterQuery, params);
-
+console.log(
+  "GET_DISTRICTS_CLUSTERS_QUERY_SUCCESS",
+  {
+    employeeId: req.user.employeeId,
+    districts: districtsRaw.length,
+    clusters: clustersRaw.length
+  }
+);
     const districts = districtsRaw
       .map(d => d.District?.trim())
       .filter(Boolean);
@@ -1574,7 +2464,15 @@ app.post("/get-districts-clusters", async (req, res) => {
     const clusters = clustersRaw
       .map(c => c.Cluster?.trim())
       .filter(c => c && c.toUpperCase() !== "CO");
-
+console.log(
+  "GET_DISTRICTS_CLUSTERS_SUCCESS",
+  {
+    employeeId: req.user.employeeId,
+    districts: districts.length,
+    clusters: clusters.length,
+    fixedCluster: effectiveCluster || null
+  }
+);
     // 5️⃣ Return
     return res.status(200).json({
       success: true,
@@ -1584,7 +2482,15 @@ app.post("/get-districts-clusters", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error in get-districts-clusters:", err);
+console.error(
+  "GET_DISTRICTS_CLUSTERS_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level: req.user?.level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Error while fetching districts & clusters",
@@ -1596,22 +2502,42 @@ app.post("/get-districts-clusters", async (req, res) => {
 //                        DEPOSITS (Dynamic + Meaning-Based Sorting)
 // ============================================================================================
 
-app.post("/get-deposits", async (req, res) => {
+app.post(
+  "/get-deposits",
+  authMiddleware,
+  async (req, res) => {
   try {
     let {
       branchCode,
       branchName,
       clusterName,
       districtName,
-      userId,
-      role,
-      level,
-      designation,
       page = 1,
       pageSize = 10,
       sortBy,                 // meaning (e.g., "gdm_deposits")
       sortOrder = "ASC",
     } = req.body;
+	
+const userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+const branchCodeFromToken = req.user.branchCode;
+const designation = req.user.designation;
+
+console.log(
+  "GET_DEPOSITS_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    branchCode,
+    branchName,
+    districtName,
+    clusterName,
+    page,
+    pageSize
+  }
+);
 
     const SECTION = "Deposits";
 
@@ -1627,12 +2553,15 @@ app.post("/get-deposits", async (req, res) => {
     level = level || "Level 1";
 
     // ✅ LEVEL-1 FIX: branchCode like "2.00" → "2"
-    if (level === "Level 1" && branchCode) {
-      const numeric = parseFloat(branchCode);
-      if (!Number.isNaN(numeric)) {
-        branchCode = parseInt(numeric, 10).toString();
-      }
-    }
+    if (level === "Level 1") {
+  branchCode = branchCodeFromToken;
+
+  const numeric = parseFloat(branchCode);
+
+  if (!Number.isNaN(numeric)) {
+    branchCode = parseInt(numeric, 10).toString();
+  }
+}
 
     page = parseInt(page);
     pageSize = parseInt(pageSize);
@@ -1662,6 +2591,13 @@ app.post("/get-deposits", async (req, res) => {
 
     // fallback minimal mapping (very rare)
     if (!mapping.length) {
+console.warn(
+  "GET_DEPOSITS_MAPPING_FALLBACK_USED",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       mapping = [];
       for (let i = 1; i <= 30; i++) {
         mapping.push({
@@ -1763,15 +2699,24 @@ app.post("/get-deposits", async (req, res) => {
       addFilter("branch_code", branchCode);
     }
 
-    if (level === "Level 2") {
-      if (!effectiveCluster)
-        return res.status(400).json({
-          success: false,
-          message: "Cluster missing for Level 2 user",
-        });
+if (level === "Level 2") {
+  if (!effectiveCluster) {
+    console.warn(
+      "GET_DEPOSITS_CLUSTER_MISSING",
+      {
+        employeeId: userId,
+        role
+      }
+    );
 
-      addFilter("cluster", effectiveCluster);
-    }
+    return res.status(400).json({
+      success: false,
+      message: "Cluster missing for Level 2 user",
+    });
+  }
+
+  addFilter("cluster", effectiveCluster);
+}
 
     // Normal filters
     if (branchCode && level !== "Level 1") addFilter("branch_code", branchCode);
@@ -1798,9 +2743,24 @@ app.post("/get-deposits", async (req, res) => {
     // ============================================================================================
     query += " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY";
     params.push(offset, pageSize);
-
+console.log(
+  "GET_DEPOSITS_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length,
+    page,
+    pageSize
+  }
+);
     const dbRows = await queryUTIDatabase(query, params);
-
+console.log(
+  "GET_DEPOSITS_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: dbRows.length
+  }
+);
     // OUT OF SCOPE CHECK — BEFORE formatting and before sending success:true
     // ❗ Level 1 users should NOT trigger out-of-scope check
     if (
@@ -1809,6 +2769,16 @@ app.post("/get-deposits", async (req, res) => {
       branchCode &&
       (clusterName || districtName)
     ) {
+console.warn(
+  "GET_DEPOSITS_OUT_OF_SCOPE",
+  {
+    employeeId: userId,
+    branchCode,
+    clusterName,
+    districtName
+  }
+);
+
       return res.status(403).json({
         success: false,
         message: "Branch is out of scope",
@@ -1841,7 +2811,28 @@ app.post("/get-deposits", async (req, res) => {
     });
 
     const formatted = formatWithMeanings(formattedRaw, meaningMap);
+await logActivity(
+  userId,
+  role,
+  "View Deposits",
+  `Level=${level}, Records=${totalRecords}`
+);
 
+console.log(
+  "VIEW_DEPOSITS_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+
+console.log(
+  "GET_DEPOSITS_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords,
+    page
+  }
+);
 
     // ============================================================================================
     // 🔟 SEND RESPONSE
@@ -1858,7 +2849,16 @@ app.post("/get-deposits", async (req, res) => {
       fixedCluster: effectiveCluster || null,
     });
   } catch (err) {
-    console.error("❌ Deposits Error:", err);
+console.error(
+  "GET_DEPOSITS_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching deposits",
@@ -1873,26 +2873,44 @@ app.post("/get-deposits", async (req, res) => {
 //     DEPOSITS ACCOUNTS OPENED (Meaning-based Dynamic Sorting)
 //============================================================================================
 
-app.post("/get-deposits-accounts", async (req, res) => {
+app.post("/get-deposits-accounts", authMiddleware ,
+async (req, res) => {
   console.log("🔹 /get-deposits-accounts called");
 
   try {
-    let {
-      branchCode,
-      branchName,
-      districtName,
-      clusterName,
-      userId,
-      role,
-      level,
-      designation,
-      sortBy,
-      sortOrder = "ASC",
-      fetchAll = false,
-      page = 1,
-      pageSize = 10,
-    } = req.body;
+let {
+  branchCode,
+  branchName,
+  districtName,
+  clusterName,
+  sortBy,
+  sortOrder = "ASC",
+  fetchAll = false,
+  page = 1,
+  pageSize = 10,
+} = req.body;
 
+const userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "GET_DEPOSITS_ACCOUNTS_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    branchCode,
+    branchName,
+    districtName,
+    clusterName,
+    page,
+    pageSize
+  }
+);
+
+const branchCodeFromToken = req.user.branchCode;
     // ------------------- Normalize Inputs -------------------
     branchCode =
       branchCode !== undefined && branchCode !== null
@@ -1911,17 +2929,21 @@ app.post("/get-deposits-accounts", async (req, res) => {
     //===========================================================
     //   🔥 LEVEL-1 FIX — convert "2.00" → "2"
     //===========================================================
-    if (level === "Level 1" && branchCode) {
-      const numeric = parseFloat(branchCode);
-      if (!Number.isNaN(numeric)) {
-        branchCode = parseInt(numeric, 10).toString();   // "2.00" → "2"
-      }
-    }
+if (level === "Level 1") {
+  branchCode = branchCodeFromToken;
 
+  const numeric = parseFloat(branchCode);
+
+  if (!Number.isNaN(numeric)) {
+    branchCode = parseInt(numeric, 10).toString();
+  }
+}
     const SECTION = "deposits_accounts_opened";
 const HIDDEN_DEPOSITS_MEANINGS = new Set([
   "vouchers",
+  "vouchers_average",   
 ]);
+
 
     //========================================================================================
     // 1️⃣ LOAD MEANING → colX MAPPING
@@ -1950,6 +2972,13 @@ let mapping = mappingRows
   );
 
     if (!mapping.length) {
+console.warn(
+  "GET_DEPOSITS_ACCOUNTS_MAPPING_FALLBACK_USED",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       mapping = [];
       for (let i = 1; i <= 30; i++) {
         mapping.push({
@@ -2058,15 +3087,24 @@ let mapping = mappingRows
       addFilter("branch_code", branchCode);
     }
 
-    if (level === "Level 2") {
-      if (!effectiveCluster)
-        return res.status(400).json({
-          success: false,
-          message: "Cluster missing for Level 2 user.",
-        });
+if (level === "Level 2") {
+  if (!effectiveCluster) {
+    console.warn(
+      "GET_DEPOSITS_ACCOUNTS_CLUSTER_MISSING",
+      {
+        employeeId: userId,
+        role
+      }
+    );
 
-      addFilter("cluster", effectiveCluster, true);
-    }
+    return res.status(400).json({
+      success: false,
+      message: "Cluster missing for Level 2 user.",
+    });
+  }
+
+  addFilter("cluster", effectiveCluster, true);
+}
 
     //========================================================================================
     // 5️⃣ NORMAL FILTERS
@@ -2096,7 +3134,16 @@ let mapping = mappingRows
       query += `${orderBySQL} OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`;
       params.push(offset, pageSize);
     }
-
+console.log(
+  "GET_DEPOSITS_ACCOUNTS_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length,
+    page,
+    pageSize
+  }
+);
     //========================================================================================
     // 7️⃣ EXECUTE
     //========================================================================================
@@ -2120,7 +3167,35 @@ let mapping = mappingRows
 
     const headers = mapping.map((m) => m.displayLabel);
     const totalPages = fetchAll ? 1 : Math.ceil(totalRecords / pageSize);
+console.log(
+  "GET_DEPOSITS_ACCOUNTS_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: dbRows.length
+  }
+);
+await logActivity(
+  userId,
+  role,
+  "View Deposits Accounts",
+  `Level=${level}, Records=${totalRecords}`
+);
 
+console.log(
+  "VIEW_DEPOSITS_ACCOUNTS_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+
+console.log(
+  "GET_DEPOSITS_ACCOUNTS_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords,
+    page
+  }
+);
     //========================================================================================
     // 🔟 RETURN RESPONSE
     //========================================================================================
@@ -2135,7 +3210,16 @@ let mapping = mappingRows
       fixedCluster: effectiveCluster || null,
     });
   } catch (err) {
-    console.error("❌ DAO ERROR:", err);
+    console.error(
+  "GET_DEPOSITS_ACCOUNTS_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching deposits accounts opened",
@@ -2149,37 +3233,66 @@ let mapping = mappingRows
 //                               ADVANCES (Meaning-based Sorting)
 //============================================================================================
 
-app.post("/get-advances", async (req, res) => {
+app.post(
+  "/get-advances",
+  authMiddleware,
+  async (req, res) => {
   try {
-    let {
+let {
+  branchCode,
+  branchName,
+  clusterName,
+  districtName,
+  page = 1,
+  pageSize = 10,
+  sortBy,
+  sortOrder = "DESC",
+} = req.body;
+
+const userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+
+console.log(
+  "GET_ADVANCES_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    filters: {
       branchCode,
       branchName,
       clusterName,
-      districtName,
-      userId,
-      role,
-      level,
-      designation,
-      page = 1,
-      pageSize = 10,
-      sortBy,             // meaning
-      sortOrder = "DESC",
-    } = req.body;
+      districtName
+    },
+    page,
+    pageSize,
+    sortBy,
+    sortOrder
+  }
+);
+
+const designation = req.user.designation;
+const branchCodeFromToken = req.user.branchCode;
 
     // ---------- Normalize ----------
-    branchCode = (branchCode || "").trim();
-    branchName = (branchName || "").trim();
-    clusterName = (clusterName || "").trim();
-    districtName = (districtName || "").trim();
+branchCode   = norm(branchCode);
+branchName   = norm(branchName);
+clusterName  = norm(clusterName);
+districtName = norm(districtName);
+
     level = level || "Level 1";
 	
 	// ===============================
 // FIX: Level 1 branchCode "2.00" → "2"
 // ===============================
-if (level === "Level 1" && branchCode) {
+if (level === "Level 1") {
+  branchCode = branchCodeFromToken;
+
   const num = parseFloat(branchCode);
+
   if (!isNaN(num)) {
-    branchCode = parseInt(num, 10).toString();   // "2.00" → "2"
+    branchCode = parseInt(num, 10).toString();
   }
 }
 
@@ -2211,7 +3324,15 @@ if (level === "Level 1" && branchCode) {
     }));
 
     // Fallback (rare)
-    if (!mapping.length) {
+if (!mapping.length) {
+
+  console.warn(
+    "GET_ADVANCES_MAPPING_FALLBACK_USED",
+    {
+      employeeId: userId,
+      section: SECTION
+    }
+  );
       mapping = [];
       for (let i = 1; i <= 30; i++) {
         mapping.push({
@@ -2266,43 +3387,77 @@ if (level === "Level 1" && branchCode) {
     let query = `SELECT ${colNames.join(", ")} FROM [dbo].[Advances] WHERE 1=1`;
     let params = [];
 
-    const addFilter = (meaning, value, exact = true) => {
-      if (!value) return;
+const addFilter = (meaning, value, exact = true) => {
+  if (!value) return;
 
-      const col = getCol(meaning);
-      if (!col) return;
+  const col = getCol(meaning);
+  if (!col) return;
 
-      if (meaning === "branch_code") {
-  query += ` AND TRY_CAST(LTRIM(RTRIM([${col}])) AS INT) = TRY_CAST(? AS INT)`;
-  params.push(value);
-  return;
-}
- else {
-        query += ` AND LOWER(LTRIM(RTRIM([${col}]))) LIKE ?`;
-        params.push(`%${value.trim().toLowerCase()}%`);
-      }
-    };
+  // ✅ branch_code numeric compare
+  if (meaning === "branch_code") {
+    query += `
+      AND TRY_CAST(LTRIM(RTRIM([${col}])) AS INT)
+          = TRY_CAST(? AS INT)
+    `;
+
+    params.push(value);
+    return;
+  }
+
+  // ✅ exact compare
+  if (exact) {
+    query += `
+      AND LTRIM(RTRIM([${col}])) = ?
+    `;
+
+    params.push(value.trim());
+  }
+
+  // ✅ LIKE compare
+  else {
+    query += `
+      AND LOWER(LTRIM(RTRIM([${col}]))) LIKE ?
+    `;
+
+    params.push(`%${value.trim().toLowerCase()}%`);
+  }
+};
 
     //========================================================================================
     // 4️⃣ LEVEL-BASED ACCESS CONTROL
     //========================================================================================
-    let effectiveCluster = clusterName;
+let effectiveCluster = clusterName;
 
-    if (level === "Level 2" && designation) {
-      const m = designation.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
-      if (m && m[1]) effectiveCluster = m[1].trim();
-    }
+if (level === "Level 2" && designation) {
+  const m = designation.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
+
+  if (m && m[1]) {
+    effectiveCluster = m[1].trim();
+  }
+}
 
     if (level === "Level 1" && branchCode) {
       addFilter("branch_code", branchCode, true);
     }
 
-    if (level === "Level 2") {
-      if (!effectiveCluster)
-        return res.status(400).json({ success: false, message: "Cluster missing." });
+if (level === "Level 2") {
+  if (!effectiveCluster) {
+console.warn(
+  "GET_ADVANCES_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
+    return res.status(400).json({
+      success: false,
+      message: "Cluster missing.",
+    });
+  }
 
-      addFilter("cluster", effectiveCluster, true);
-    }
+  addFilter("cluster", effectiveCluster, true);
+}
 
     // NORMAL FILTERS
     if (branchCode && level !== "Level 1") addFilter("branch_code", branchCode, true);
@@ -2332,6 +3487,14 @@ if (level === "Level 1" && branchCode) {
     params.push(offset, pageSize);
 
     const dbRows = await queryUTIDatabase(query, params);
+console.log(
+  "GET_ADVANCES_DATA_FETCHED",
+  {
+    employeeId: userId,
+    records: dbRows.length,
+    page
+  }
+);
 
     //========================================================================================
     // 7️⃣ FORMAT OUTPUT — (React-safe)
@@ -2358,7 +3521,15 @@ if (level === "Level 1" && branchCode) {
       if (!value) return;
       const col = getCol(meaning);
       if (!col) return;
+if (meaning === "branch_code") {
+  countQuery += `
+    AND TRY_CAST(LTRIM(RTRIM([${col}])) AS INT)
+        = TRY_CAST(? AS INT)
+  `;
 
+  countParams.push(value);
+  return;
+}
       if (exact) {
         countQuery += ` AND LTRIM(RTRIM([${col}])) = ?`;
         countParams.push(value.trim());
@@ -2414,12 +3585,20 @@ if (level === "Level 1" && branchCode) {
     //========================================================================================
     // 🔟 RETURN RESPONSE
     //========================================================================================
-    await logActivity(
-      userId,
-      role,
-      "View Advances",
-      `Filters: Branch ${branchCode}, Cluster ${effectiveCluster}`
-    );
+await logActivity(
+  userId,
+  role,
+  "View Advances",
+  `Filters: Branch ${branchCode}, Cluster ${effectiveCluster}`
+);
+
+console.log(
+  "VIEW_ADVANCES_ACTIVITY_LOGGED",
+  {
+    employeeId: userId,
+    role
+  }
+);
 
     // Build meaningMap: displayLabel -> meaning (for frontend graphs)
     const meaningMap = {};
@@ -2428,6 +3607,17 @@ if (level === "Level 1" && branchCode) {
         meaningMap[m.displayLabel] = m.meaning;
       }
     });
+
+console.log(
+  "GET_ADVANCES_SUCCESS",
+  {
+    employeeId: userId,
+    role,
+    totalRecords,
+    totalPages: Math.ceil(totalRecords / pageSize),
+    returnedRecords: data.length
+  }
+);
 
     //========================================================================================
     // 🔟 FINAL RESPONSE
@@ -2446,7 +3636,15 @@ if (level === "Level 1" && branchCode) {
 
 
   } catch (err) {
-    console.error("❌ ADVANCES ERROR:", err);
+   console.error(
+  "GET_ADVANCES_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching advances",
@@ -2460,48 +3658,73 @@ if (level === "Level 1" && branchCode) {
 //                             NPA REPORT (Meaning-based Sorting)
 //============================================================================================
 
-app.post("/get-npa", async (req, res) => {
+app.post("/get-npa", authMiddleware, async (req, res) => {
   try {
-    let {
+let {
+  branchCode,
+  branchName,
+  clusterName,
+  districtName,
+  page = 1,
+  pageSize = 10,
+  sortBy,
+  sortOrder = "DESC",
+} = req.body;
+
+// ✅ Always take identity from JWT
+const userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+
+console.log(
+  "GET_NPA_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    filters: {
       branchCode,
       branchName,
       clusterName,
-      districtName,
-      userId,
-      role,
-      level,
-      designation,
-      page = 1,
-      pageSize = 10,
-      sortBy,        // 👉 MEANING (not label)
-      sortOrder = "DESC",
-    } = req.body;
+      districtName
+    },
+    page,
+    pageSize,
+    sortBy,
+    sortOrder
+  }
+);
 
-    // Normalize
-    branchCode = (branchCode || "").trim();
-    branchName = (branchName || "").trim();
-    clusterName = (clusterName || "").trim();
-    districtName = (districtName || "").trim();
-    level = level || "Level 1";
-	
-	const HIDDEN_NPA_MEANINGS = new Set([
+const designation = req.user.designation;
+const tokenBranchCode = req.user.branchCode;
+
+// Normalize
+branchCode   = norm(branchCode);
+branchName   = norm(branchName);
+clusterName  = norm(clusterName);
+districtName = norm(districtName);
+
+// ✅ Force Level 1 to use branch from JWT
+if (level === "Level 1") {
+  branchCode = tokenBranchCode;
+}
+
+level = level || "Level 1";
+
+const HIDDEN_NPA_MEANINGS = new Set([
   "unstamped_npa_prev_accounts",
   "unstamped_npa_prev_balance",
   "npa_monthly_accounts",
   "npa_monthly_balance",
 ]);
 
-	
-	// ===============================
-// FIX: Level 1 branchCode "2.00" → "2"
-// ===============================
+// ✅ Level 1 branchCode "2.00" → "2"
 if (level === "Level 1" && branchCode) {
   const num = parseFloat(branchCode);
   if (!isNaN(num)) {
-    branchCode = parseInt(num, 10).toString();   // "2.00" → "2"
+    branchCode = parseInt(num, 10).toString();
   }
 }
-
 
     page = parseInt(page, 10) || 1;
     pageSize = parseInt(pageSize, 10) || 10;
@@ -2538,6 +3761,13 @@ if (level === "Level 1" && branchCode) {
 
     // Fallback (rare)
     if (!mapping.length) {
+console.warn(
+  "GET_NPA_MAPPING_FALLBACK_USED",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       mapping = [];
       for (let i = 1; i <= 30; i++) {
         mapping.push({
@@ -2645,7 +3875,22 @@ if (level === "Level 1" && branchCode) {
       const match = designation.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
       if (match && match[1]) effectiveCluster = match[1].trim();
     }
+if (level === "Level 2" && !effectiveCluster) {
 
+  console.warn(
+    "GET_NPA_CLUSTER_MISSING",
+    {
+      employeeId: userId,
+      role,
+      level
+    }
+  );
+
+  return res.status(400).json({
+    success: false,
+    message: "Cluster missing."
+  });
+}
     if (level === "Level 1" && branchCode) {
       addFilter("branch_code", branchCode, true);
     }
@@ -2683,6 +3928,14 @@ if (level === "Level 1" && branchCode) {
     params.push(offset, pageSize);
 
     const dbRows = await queryUTIDatabase(query, params);
+console.log(
+  "GET_NPA_DATA_FETCHED",
+  {
+    employeeId: userId,
+    records: dbRows.length,
+    page
+  }
+);
     const totalRecords =
       (await queryUTIDatabase(countQuery, countParams))[0]?.totalRecords || 0;
 
@@ -2751,7 +4004,13 @@ if (level === "Level 1" && branchCode) {
       "View NPA",
       `Filters → Branch: ${branchCode}, Cluster: ${effectiveCluster}`
     );
-
+console.log(
+  "VIEW_NPA_ACTIVITY_LOGGED",
+  {
+    employeeId: userId,
+    role
+  }
+);
    // Build meaningMap: displayLabel -> meaning (for frontend graphs)
     const meaningMap = {};
     mapping.forEach((m) => {
@@ -2763,6 +4022,17 @@ if (level === "Level 1" && branchCode) {
     //========================================================================================
     // 🔟 FINAL RESPONSE
     //========================================================================================
+
+console.log(
+  "GET_NPA_SUCCESS",
+  {
+    employeeId: userId,
+    role,
+    totalRecords,
+    totalPages: Math.ceil(totalRecords / pageSize),
+    returnedRecords: data.length
+  }
+);
            return res.json({
       success: true,
       headers,
@@ -2776,7 +4046,15 @@ if (level === "Level 1" && branchCode) {
     });
 
   } catch (err) {
-    console.error("❌ NPA ERROR:", err);
+   console.error(
+  "GET_NPA_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching NPA",
@@ -2789,39 +4067,61 @@ if (level === "Level 1" && branchCode) {
 //                         LOANS SANCTIONED (Meaning-based Sorting)
 //============================================================================================
 
-app.post("/get-loans-sanctioned", async (req, res) => {
+app.post("/get-loans-sanctioned", authMiddleware, async (req, res) => {
   try {
-    let {
+let {
+  branchCode,
+  branchName,
+  clusterName,
+  districtName,
+  page = 1,
+  pageSize = 10,
+  sortBy,
+  sortOrder = "DESC",
+} = req.body;
+
+const userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+
+console.log(
+  "GET_LOANS_SANCTIONED_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    filters: {
       branchCode,
       branchName,
       clusterName,
-      districtName,
-      userId,
-      role,
-      level,
-      designation,
-      page = 1,
-      pageSize = 10,
-      sortBy,        // 👉 THIS IS MEANING (over_all_fy_accounts, over_all_fy_amount, etc.)
-      sortOrder = "DESC",
-    } = req.body;
+      districtName
+    },
+    page,
+    pageSize,
+    sortBy,
+    sortOrder
+  }
+);
 
-    console.log("🔹 /get-loans-sanctioned (meaning-based) called");
+const designation = req.user.designation;
+const branchCodeFromToken = req.user.branchCode;
 
     // ------------------------------------------------------
     // Normalize values
     // ------------------------------------------------------
-    branchCode = (branchCode || "").trim();
-    branchName = (branchName || "").trim();
-    clusterName = (clusterName || "").trim();
-    districtName = (districtName || "").trim();
-    level = level || "Level 1";
+branchCode   = norm(branchCode);
+branchName   = norm(branchName);
+clusterName  = norm(clusterName);
+districtName = norm(districtName);
 	
-	// ===============================
-// FIX: Level 1 branchCode "2.00" → "2"
-// ===============================
-if (level === "Level 1" && branchCode) {
+level = level || "Level 1";
+
+// ✅ Force Level 1 branch from JWT
+if (level === "Level 1") {
+  branchCode = branchCodeFromToken;
+
   const num = parseFloat(branchCode);
+
   if (!isNaN(num)) {
     branchCode = parseInt(num, 10).toString();
   }
@@ -2856,6 +4156,13 @@ if (level === "Level 1" && branchCode) {
 
     // Fallback mapping if no MIS_Column_Mapping yet (very rare safety net)
     if (!mapping.length) {
+console.warn(
+  "GET_LOANS_SANCTIONED_MAPPING_FALLBACK_USED",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       mapping = [];
       for (let i = 1; i <= 30; i++) {
         mapping.push({
@@ -2964,20 +4271,29 @@ if (level === "Level 1" && branchCode) {
     //========================================================================================
     // 4️⃣ LEVEL-BASED ACCESS CONTROL (RLS)
     //========================================================================================
-    let effectiveCluster = null;
+ let effectiveCluster = clusterName;
 
-    if (level === "Level 2") {
+if (level === "Level 2") {
       // Extract cluster from designation: "Cluster Head-XYZ" or "Cluster Head: XYZ"
       if (designation?.match(/Cluster\s*Head\s*[-:]\s*/i)) {
         effectiveCluster = designation.replace(
           /Cluster\s*Head\s*[-:]\s*/i,
           ""
         ).trim();
-      } else if (clusterName) {
-        effectiveCluster = clusterName.trim();
-      }
+      } 
+	  clusterName = effectiveCluster;
 
       if (!effectiveCluster) {
+
+console.warn(
+  "GET_LOANS_SANCTIONED_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
+
         return res.status(400).json({
           success: false,
           message: "Cluster information missing for Level 2 user.",
@@ -3003,6 +4319,14 @@ if (level === "Level 1" && branchCode) {
           !chk.length ||
           chk[0].Cluster.trim().toLowerCase() !== effectiveCluster.toLowerCase()
         ) {
+console.warn(
+  "GET_LOANS_SANCTIONED_BRANCH_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    branchCode,
+    cluster: effectiveCluster
+  }
+);
           return res.status(403).json({
             success: false,
             message: `❌ Branch ${branchCode} does not belong to your cluster (${effectiveCluster}).`,
@@ -3025,6 +4349,14 @@ if (level === "Level 1" && branchCode) {
           !chk.length ||
           chk[0].Cluster.trim().toLowerCase() !== effectiveCluster.toLowerCase()
         ) {
+console.warn(
+  "GET_LOANS_SANCTIONED_BRANCHNAME_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    branchName,
+    cluster: effectiveCluster
+  }
+);
           return res.status(403).json({
             success: false,
             message: `❌ Branch ${branchName} does not belong to your cluster (${effectiveCluster}).`,
@@ -3035,13 +4367,21 @@ if (level === "Level 1" && branchCode) {
       // Lock to this cluster
       addFilter("cluster", effectiveCluster, true);
     }
-
+if (level === "Level 1" && branchCode) {
+  addFilter("branch_code", branchCode, true);
+}
     // General filters
-    if (branchCode) addFilter("branch_code", branchCode);
-    if (branchName) addFilter("branch_name", branchName, false);
-    if (districtName) addFilter("district", districtName, false);
-    if (clusterName && level !== "Level 2")
-      addFilter("cluster", clusterName, false);
+if (level !== "Level 1" && branchCode)
+  addFilter("branch_code", branchCode);
+
+if (branchName)
+  addFilter("branch_name", branchName, false);
+
+if (districtName)
+  addFilter("district", districtName, false);
+
+if (clusterName && level !== "Level 2")
+  addFilter("cluster", clusterName, false);
 
     //========================================================================================
     // 5️⃣ MEANING-BASED SORTING
@@ -3069,6 +4409,14 @@ if (level === "Level 1" && branchCode) {
     // 7️⃣ EXECUTE MAIN & COUNT QUERIES
     //========================================================================================
     const dbRows = await queryUTIDatabase(query, params);
+console.log(
+  "GET_LOANS_SANCTIONED_DATA_FETCHED",
+  {
+    employeeId: userId,
+    records: dbRows.length,
+    page
+  }
+);
     const countRows = await queryUTIDatabase(countQuery, countParams);
     const totalRecords = Number(countRows?.[0]?.totalRecords || 0);
     const totalPages = Math.ceil(totalRecords / pageSize);
@@ -3153,9 +4501,44 @@ if (level === "Level 1" && branchCode) {
       }
     });
 
+try {
+  await logActivity(
+    userId,
+    role,
+    "View Loans Sanctioned",
+    `Filters: Branch ${branchCode}, Cluster ${effectiveCluster}`
+  );
+
+  console.log(
+    "VIEW_LOANS_SANCTIONED_ACTIVITY_LOGGED",
+    {
+      employeeId: userId,
+      role
+    }
+  );
+} catch (logErr) {
+  console.error(
+    "VIEW_LOANS_SANCTIONED_ACTIVITY_LOG_FAILED",
+    {
+      employeeId: userId,
+      error: logErr.message
+    }
+  );
+}
+
     //========================================================================================
     // 🔟 FINAL RESPONSE
     //========================================================================================
+console.log(
+  "GET_LOANS_SANCTIONED_SUCCESS",
+  {
+    employeeId: userId,
+    role,
+    totalRecords,
+    totalPages,
+    returnedRecords: data.length
+  }
+);
         return res.json({
       success: true,
       headers,          // full headers as shown in table
@@ -3174,7 +4557,15 @@ if (level === "Level 1" && branchCode) {
     });
 
   } catch (err) {
-    console.error("❌ Error (meaning-based loans sanctioned):", err);
+    console.error(
+  "GET_LOANS_SANCTIONED_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching loans sanctioned",
@@ -3188,9 +4579,22 @@ if (level === "Level 1" && branchCode) {
 //                     DEPOSITS CLUSTER SUMMARY (Dynamic Mapping + Intelligent Grouping)
 //============================================================================================
 
-app.post("/get-cluster-deposits-summary", async (req, res) => {
+app.post("/get-cluster-deposits-summary", authMiddleware, async (req, res) => {
   try {
-    const { userId, role, level, designation } = req.body;
+    const userId = req.user.employeeId;
+const role = req.user.role;
+const level = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "CLUSTER_DEPOSITS_SUMMARY_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
+
     const SECTION = "DCS"; // Deposits cluster section (same as ACS/NPA mapping format)
 
     // 1️⃣ Fetch mapping
@@ -3205,6 +4609,13 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
     );
 
     if (!mappingRows.length) {
+console.warn(
+  "CLUSTER_DEPOSITS_SUMMARY_MAPPING_MISSING",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       return res.status(400).json({
         success: false,
         message: "⚠️ Deposits summary mapping missing. Upload DCS MIS first.",
@@ -3240,7 +4651,16 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
     const clusterCol = getColByMeaning("cluster") || "col1";
 
     // Build SELECT list
-    const colList = mapping.map((m) => `[${m.colName}]`).join(", ");
+ const colList = mapping
+  .map(
+    (m) =>
+      `CASE 
+         WHEN ISNUMERIC(REPLACE(REPLACE([${m.colName}], ',', ''), '-', '0')) = 1 
+         THEN REPLACE(REPLACE([${m.colName}], ',', ''), '-', '0')
+         ELSE [${m.colName}]
+       END AS [${m.colName}]`
+  )
+  .join(", ");
 
     // 2️⃣ Build SQL with Level-2 filtering
     let query = `SELECT ${colList} FROM [dbo].[DCS] WHERE 1=1`;
@@ -3249,17 +4669,39 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
     let effectiveLevel = level || "Level 1";
     let effectiveCluster = null;
 
+if (effectiveLevel === "Level 1") {
+console.warn(
+  "CLUSTER_DEPOSITS_SUMMARY_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied. Cluster summary is not available for Level 1 users.",
+  });
+}
+
     // Level 2 → Determine Cluster
     if (effectiveLevel === "Level 2") {
-      if (designation && designation.toLowerCase().includes("cluster head")) {
-        effectiveCluster = designation.replace(/Cluster Head\s*-\s*/i, "").trim();
-      }
+      const match = designation?.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
+
+if (match && match[1]) {
+  effectiveCluster = match[1].trim();
+}
 
       if (effectiveCluster) {
         query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
         params.push(effectiveCluster.toLowerCase());
       } else {
-        console.warn("⚠ No cluster found for Level 2 user — blocking data.");
+      console.warn(
+  "CLUSTER_DEPOSITS_SUMMARY_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role
+  }
+);
         query += " AND 1=0"; // Block unauthorized access
       }
     }
@@ -3276,11 +4718,31 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
         ELSE 7
       END
     `;
-
+console.log(
+  "CLUSTER_DEPOSITS_SUMMARY_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length
+  }
+);
     // 4️⃣ Run Query
     const rows = await queryUTIDatabase(query, params);
-
+console.log(
+  "CLUSTER_DEPOSITS_SUMMARY_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: rows.length
+  }
+);
     if (!rows.length) {
+console.warn(
+  "CLUSTER_DEPOSITS_SUMMARY_NO_RECORDS",
+  {
+    employeeId: userId,
+    level
+  }
+);
       return res.json({
         success: true,
         headers: [],
@@ -3347,7 +4809,25 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
       if (cols.length >= 2) groupedHeaders.push({ title, cols });
       else groupedHeaders.push({ title, cols: [cols[0]], single: true });
     }
-
+await logActivity(
+  userId,
+  role,
+  "View Cluster Deposits Summary",
+  `Level=${level}`
+);
+console.log(
+  "VIEW_CLUSTER_DEPOSITS_SUMMARY_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+console.log(
+  "CLUSTER_DEPOSITS_SUMMARY_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords
+  }
+);
     // 9️⃣ Return response
     return res.json({
   success: true,
@@ -3357,28 +4837,49 @@ app.post("/get-cluster-deposits-summary", async (req, res) => {
   totalRecords,
 });
 
-  } catch (err) {
-    console.error("❌ Error in /get-cluster-deposits-summary:", err);
-    return res.status(500).json({
-      success: false,
-      error: "Server error while fetching Deposits Summary",
-    });
-  }
+ } catch (err) {
+  console.error(
+    "CLUSTER_DEPOSITS_SUMMARY_FAILED",
+    {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      level: req.user?.level,
+      error: err.message
+    }
+  );
+
+  return res.status(500).json({
+    success: false,
+    error: "Server error while fetching Deposits Summary",
+  });
+}
 });
-
-
 
 //============================================================================================
 //                        DEPOSITS ACCOUNTS OPENED (DAOCS) CLUSTER SUMMARY
 //============================================================================================
-
-app.post("/get-daocs", async (req, res) => {
+app.post("/get-daocs", authMiddleware, async (req, res) => {
   try {
-    const { userId, role, level, clusterName, branchCode, designation } = req.body;
-
+    const userId = req.user.employeeId;
+const role = req.user.role;
+const level = req.user.level;
+const designation = req.user.designation;
+const clusterName = req.user.clusterName || null;
+const branchCode = req.user.branchCode;
+console.log(
+  "GET_DAOCS_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    clusterName,
+    branchCode
+  }
+);
     const SECTION = "DAOCS"; // mapping section
 const HIDDEN_DAOCS_MEANINGS = new Set([
   "vouchers",
+  "vouchers_average",
 ]);
 
     // 1️⃣ LOAD MAPPING FOR DAOCS
@@ -3393,6 +4894,13 @@ const HIDDEN_DAOCS_MEANINGS = new Set([
     );
 
     if (!mappingRows.length) {
+console.warn(
+  "GET_DAOCS_MAPPING_MISSING",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       return res.status(400).json({
         success: false,
         message:
@@ -3433,28 +4941,36 @@ const mapping = mappingRows
     const colList = mapping.map((m) => `[${m.colName}]`).join(", ");
     let query = `SELECT ${colList} FROM [dbo].[DAOCS] WHERE 1=1`;
     const params = [];
+	
+	// 🔒 Level 1 users cannot access cluster summaries
+if (level === "Level 1") {
+console.warn(
+  "GET_DAOCS_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied. Cluster summary is not available for Level 1 users.",
+  });
+}
 
     // ------ LEVEL-2 RESTRICTION -------
-    if (level === "Level 2") {
-      let cluster = null;
+if (level === "Level 2") {
+  let cluster = null;
 
-      if (clusterName) cluster = clusterName.trim().toLowerCase();
-      else if (designation?.toLowerCase().includes("cluster head")) {
-        cluster = designation.replace(/cluster head\s*[-:]?/i, "").trim().toLowerCase();
-      }
+  const match = designation?.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
+
+  if (match && match[1]) {
+    cluster = match[1].trim().toLowerCase();
+  }
 
       if (cluster) {
         query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
         params.push(cluster);
       }
-    }
-
-    // ------ LEVEL-1 RESTRICTION -------
-    const branchCodeCol = getColByMeaning("branch_code");
-
-    if (level === "Level 1" && branchCode) {
-      query += ` AND LTRIM(RTRIM([${branchCodeCol}])) = ?`;
-      params.push(branchCode.trim());
     }
 
     // 3️⃣ ORDERING
@@ -3468,9 +4984,22 @@ const mapping = mappingRows
         ELSE 6
       END
     `;
-
+console.log(
+  "GET_DAOCS_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length
+  }
+);
     const rows = await queryUTIDatabase(query, params);
-
+console.log(
+  "GET_DAOCS_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: rows.length
+  }
+);
     // 4️⃣ MAP colX → displayLabel
     const data = rows.map((r) => {
       const obj = {};
@@ -3482,6 +5011,13 @@ const mapping = mappingRows
     });
 
     if (!data.length) {
+console.warn(
+  "GET_DAOCS_NO_RECORDS",
+  {
+    employeeId: userId,
+    level
+  }
+);
       return res.json({
         success: true,
         headers: [],
@@ -3516,35 +5052,42 @@ if (SECTION === "DAOCS") {
     return { key: label, label }; // frontend expects key = displayLabel
   };
 
-  const groups = [
-    {
-      title: "TDR",
-      cols: [
-        makeColObj("tdr_accounts", "TDR A/Cs"),
-        makeColObj("tdr_amount", "TDR Amount"),
-      ].filter(Boolean),
-    },
-    {
-      title: "RD",
-      cols: [
-        makeColObj("rd_accounts", "RD A/Cs"),
-        makeColObj("rd_amount", "RD Amount"),
-      ].filter(Boolean),
-    },
-    {
-      title: "Savings",
-      cols: [
-        makeColObj("savings_accounts", "Savings A/Cs"),
-        makeColObj("savings_amount", "Savings Amount"),
-      ].filter(Boolean),
-    },
-    {
-      title: "Others",
-      cols: [
-        makeColObj("vouchers", "Vouchers"),
-      ].filter(Boolean),
-    },
-  ];
+const groups = [
+  {
+    title: "TDR",
+    cols: [
+      makeColObj("tdr_accounts", "TDR A/Cs"),
+      makeColObj("tdr_amount", "TDR Amount"),
+    ].filter(Boolean),
+  },
+  {
+    title: "RD",
+    cols: [
+      makeColObj("rd_accounts", "RD A/Cs"),
+      makeColObj("rd_amount", "RD Amount"),
+    ].filter(Boolean),
+  },
+  {
+    title: "Savings",
+    cols: [
+      makeColObj("savings_accounts", "Savings A/Cs"),
+      makeColObj("savings_amount", "Savings Amount"),
+    ].filter(Boolean),
+  },
+  {
+    title: "Current",
+    cols: [
+      makeColObj("current_accounts", "Current A/Cs"),
+      makeColObj("current_amount", "Current Amount"),
+    ].filter(Boolean),
+  },
+  {
+    title: "Others",
+    cols: [
+      makeColObj("vouchers", "Vouchers"),
+    ].filter(Boolean),
+  },
+];
 
   // remove empty groups (if a column wasn't present)
   groupedHeaders = groups.filter((g) => g.cols && g.cols.length);
@@ -3585,7 +5128,19 @@ if (SECTION === "DAOCS") {
       "View Deposits Accounts Opened Summary",
       `Fetched ${data.length} rows | Level:${level}`
     );
-
+console.log(
+  "VIEW_DAOCS_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+console.log(
+  "GET_DAOCS_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords: data.length
+  }
+);
     return res.json({
       success: true,
       headers: staticHeaders,
@@ -3594,21 +5149,43 @@ if (SECTION === "DAOCS") {
       totalRecords: data.length,
     });
   } catch (err) {
-    console.error("❌ Error in /get-daocs:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Server error while fetching DAOCS summary",
-    });
-  }
+  console.error(
+    "GET_DAOCS_FAILED",
+    {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      level: req.user?.level,
+      error: err.message,
+      stack: err.stack
+    }
+  );
+
+  return res.status(500).json({
+    success: false,
+    message: "Server error while fetching DAOCS summary",
+  });
+}
 });
 
 //============================================================================================
 //                     ADVANCES SUMMARY (Dynamic Mapping + Intelligent Grouping)
 //============================================================================================
 
-app.post("/get-advances-summary", async (req, res) => {
+app.post("/get-advances-summary", authMiddleware, async (req, res) => {
+const userId = req.user.employeeId;
+const role = req.user.role;
+const level = req.user.level;
+const designation = req.user.designation;
   try {
-    const { userId, role, level, clusterName } = req.body;
+
+console.log(
+  "ADVANCES_SUMMARY_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
     const SECTION = "ACS"; // Advances Cluster Summary section
 
     // 1️⃣ Fetch mapping
@@ -3623,6 +5200,13 @@ app.post("/get-advances-summary", async (req, res) => {
     );
 
     if (!mappingRows.length) {
+console.warn(
+  "ADVANCES_SUMMARY_MAPPING_MISSING",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       return res.status(400).json({
         success: false,
         message: "⚠️ Advances summary mapping missing. Upload ACS MIS first.",
@@ -3660,11 +5244,48 @@ app.post("/get-advances-summary", async (req, res) => {
     // 2️⃣ Build SQL with Level-2 filtering
     let query = `SELECT ${colList} FROM [dbo].[ACS] WHERE 1=1`;
     const params = [];
+	
+	// 🔒 Level 1 users cannot access cluster summaries
+if (level === "Level 1") {
+console.warn(
+  "ADVANCES_SUMMARY_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied. Cluster summary is not available for Level 1 users.",
+  });
+}
 
-    if (level === "Level 2" && clusterName?.trim()) {
-      query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
-      params.push(clusterName.trim().toLowerCase());
-    }
+if (level === "Level 2") {
+  let effectiveCluster = null;
+
+  const match = designation?.match(/Cluster\s*Head\s*[-:]\s*(.*)/i);
+
+  if (match && match[1]) {
+    effectiveCluster = match[1].trim().toLowerCase();
+  }
+
+  if (!effectiveCluster) {
+console.warn(
+  "ADVANCES_SUMMARY_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role
+  }
+);
+    return res.status(403).json({
+      success: false,
+      message: "Cluster information missing for Level 2 user.",
+    });
+  }
+
+  query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
+  params.push(effectiveCluster);
+}
 
     // 3️⃣ Sorting
     query += `
@@ -3677,10 +5298,31 @@ app.post("/get-advances-summary", async (req, res) => {
         ELSE 6
       END
     `;
-
+console.log(
+  "ADVANCES_SUMMARY_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length
+  }
+);
     const rows = await queryUTIDatabase(query, params);
-
+console.log(
+  "ADVANCES_SUMMARY_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: rows.length
+  }
+);
     if (!rows.length) {
+console.warn(
+  "ADVANCES_SUMMARY_NO_RECORDS",
+  {
+    employeeId: userId,
+    level
+  }
+);
+
       return res.json({
         success: true,
         headers: [],
@@ -3754,7 +5396,26 @@ app.post("/get-advances-summary", async (req, res) => {
     mapping.forEach((m) => {
       if (m.meaning) meaningMap[m.meaning] = m.displayLabel;
     });
+await logActivity(
+  userId,
+  role,
+  "View Advances Summary",
+  `Level=${level}`
+);
 
+console.log(
+  "VIEW_ADVANCES_SUMMARY_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+console.log(
+  "ADVANCES_SUMMARY_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords
+  }
+);
     return res.json({
       success: true,
       headers: staticHeaders,
@@ -3764,7 +5425,15 @@ app.post("/get-advances-summary", async (req, res) => {
       totalRecords,
     });
   } catch (err) {
-    console.error("❌ Error in /get-advances-summary:", err);
+   console.error(
+  "ADVANCES_SUMMARY_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       error: "Server error while fetching Advances Summary",
@@ -3778,10 +5447,20 @@ app.post("/get-advances-summary", async (req, res) => {
 //                                      NPA SUMMARY (Dynamic Mapping + Grouped Headers)
 //============================================================================================
 
-// BACKEND: get-npa-summary (replace existing NPACS route)
-app.post("/get-npa-summary", async (req, res) => {
+app.post("/get-npa-summary", authMiddleware, async (req, res) => {
+    const userId = req.user.employeeId;
+const role = req.user.role;
+const level = req.user.level;
+const designation = req.user.designation;
   try {
-    const { userId, role, level, clusterName } = req.body;
+console.log(
+  "NPA_SUMMARY_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
     const SECTION = "NPACS";
 
     // 🔒 Hidden meanings (same as /get-npa)
@@ -3804,6 +5483,13 @@ app.post("/get-npa-summary", async (req, res) => {
     );
 
     if (!mappingRows || !mappingRows.length) {
+console.warn(
+  "NPA_SUMMARY_MAPPING_MISSING",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       return res.status(400).json({
         success: false,
         message: "⚠️ NPA summary mapping not found. Please upload NPACS MIS first.",
@@ -3847,11 +5533,50 @@ app.post("/get-npa-summary", async (req, res) => {
     // 2️⃣ Build SQL + level filter
     let query = `SELECT ${colList} FROM [dbo].[NPACS] WHERE 1=1`;
     const params = [];
+	
+	// 🔒 Level 1 users cannot access cluster summaries
+if (level === "Level 1") {
+console.warn(
+  "NPA_SUMMARY_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied. Cluster summary is not available for Level 1 users.",
+  });
+}
 
-    if (level === "Level 2" && clusterName && clusterName.trim() !== "") {
-      query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
-      params.push(clusterName.trim().toLowerCase());
-    }
+if (level === "Level 2") {
+  let effectiveCluster = null;
+
+  const match = designation?.match(
+    /Cluster\s*Head\s*[-:]\s*(.*)/i
+  );
+
+  if (match && match[1]) {
+    effectiveCluster = match[1].trim().toLowerCase();
+  }
+
+  if (!effectiveCluster) {
+console.warn(
+  "NPA_SUMMARY_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role
+  }
+);
+    return res.status(403).json({
+      success: false,
+      message: "Cluster information missing for Level 2 user.",
+    });
+  }
+
+  query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
+  params.push(effectiveCluster);
+}
 
     // 3️⃣ Custom ordering (unchanged)
     query += `
@@ -3864,17 +5589,42 @@ app.post("/get-npa-summary", async (req, res) => {
         ELSE 6
       END
     `;
-
+console.log(
+  "NPA_SUMMARY_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length
+  }
+);
     const rows = await queryUTIDatabase(query, params);
-
-    await logActivity(
-      userId,
-      role,
-      "View NPA Summary",
-      `Level:${level || "All"}, Cluster:${clusterName || "All"}`
-    );
-
+console.log(
+  "NPA_SUMMARY_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: rows.length
+  }
+);
+await logActivity(
+  userId,
+  role,
+  "View NPA Summary",
+  `Level:${level || "All"}`
+);
+console.log(
+  "VIEW_NPA_SUMMARY_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
     if (!rows || rows.length === 0) {
+console.warn(
+  "NPA_SUMMARY_NO_RECORDS",
+  {
+    employeeId: userId,
+    level
+  }
+);
       return res.json({
         success: true,
         headers: [],
@@ -3942,7 +5692,13 @@ app.post("/get-npa-summary", async (req, res) => {
     });
 
     const totalRecords = rows.length;
-
+console.log(
+  "NPA_SUMMARY_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords
+  }
+);
     return res.json({
       success: true,
       headers: staticHeaders,
@@ -3952,7 +5708,15 @@ app.post("/get-npa-summary", async (req, res) => {
       totalRecords,
     });
   } catch (err) {
-    console.error("❌ Error in /get-npa-summary:", err.stack || err);
+    console.error(
+  "NPA_SUMMARY_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level: req.user?.level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       error: "Server error while fetching NPA Summary",
@@ -3966,9 +5730,20 @@ app.post("/get-npa-summary", async (req, res) => {
 //============================================================================================
 
 // BACKEND: get-loans-sanctioned-summary (replace existing LSCS route)
-app.post("/get-loans-sanctioned-summary", async (req, res) => {
+app.post("/get-loans-sanctioned-summary", authMiddleware, async (req, res) => {
+    const userId = req.user.employeeId;
+const role = req.user.role;
+const level = req.user.level;
+const designation = req.user.designation;
   try {
-    const { userId, role, level, clusterName } = req.body;
+console.log(
+  "LOANS_SANCTIONED_SUMMARY_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level
+  }
+);
     const SECTION = "LSCS";
 
     // 1️⃣ Load mapping
@@ -3983,6 +5758,13 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
     );
 
     if (!mappingRows || !mappingRows.length) {
+console.warn(
+  "LOANS_SANCTIONED_SUMMARY_MAPPING_MISSING",
+  {
+    employeeId: userId,
+    section: SECTION
+  }
+);
       return res.status(400).json({
         success: false,
         message: "⚠️ Loans Sanctioned summary mapping not found. Please upload LSCS MIS first.",
@@ -4016,11 +5798,50 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
     // 2️⃣ Build base query + level filter
     let query = `SELECT ${colList} FROM [dbo].[LSCS] WHERE 1=1`;
     const params = [];
+	
+	// 🔒 Level 1 users cannot access cluster summaries
+if (level === "Level 1") {
+console.warn(
+  "LOANS_SANCTIONED_SUMMARY_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied. Cluster summary is not available for Level 1 users.",
+  });
+}
 
-    if (level === "Level 2" && clusterName && clusterName.trim() !== "") {
-      query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
-      params.push(clusterName.trim().toLowerCase());
-    }
+if (level === "Level 2") {
+  let effectiveCluster = null;
+
+  const match = designation?.match(
+    /Cluster\s*Head\s*[-:]\s*(.*)/i
+  );
+
+  if (match && match[1]) {
+    effectiveCluster = match[1].trim().toLowerCase();
+  }
+
+  if (!effectiveCluster) {
+console.warn(
+  "LOANS_SANCTIONED_SUMMARY_CLUSTER_MISSING",
+  {
+    employeeId: userId,
+    role
+  }
+);
+    return res.status(403).json({
+      success: false,
+      message: "Cluster information missing for Level 2 user.",
+    });
+  }
+
+  query += ` AND LOWER(LTRIM(RTRIM([${clusterCol}]))) = ?`;
+  params.push(effectiveCluster);
+}
 
     // 3️⃣ Ordering
     query += `
@@ -4033,17 +5854,44 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
         ELSE 6
       END
     `;
-
+console.log(
+  "LOANS_SANCTIONED_SUMMARY_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level,
+    paramsCount: params.length
+  }
+);
     const rows = await queryUTIDatabase(query, params);
+console.log(
+  "LOANS_SANCTIONED_SUMMARY_QUERY_SUCCESS",
+  {
+    employeeId: userId,
+    records: rows.length
+  }
+);
+await logActivity(
+  userId,
+  role,
+  "View Loans Sanctioned Summary",
+  `Level=${level}`
+);
 
-    await logActivity(
-      userId,
-      role,
-      "View Loans Sanctioned Summary",
-      `Level:${level || "All"}, Cluster:${clusterName || "All"}`
-    );
+console.log(
+  "VIEW_LOANS_SANCTIONED_SUMMARY_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
 
     if (!rows || rows.length === 0) {
+console.warn(
+  "LOANS_SANCTIONED_SUMMARY_NO_RECORDS",
+  {
+    employeeId: userId,
+    level
+  }
+);
       return res.json({
         success: true,
         headers: [],
@@ -4105,7 +5953,13 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
     });
 
     const totalRecords = rows.length;
-
+console.log(
+  "LOANS_SANCTIONED_SUMMARY_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords
+  }
+);
     return res.json({
       success: true,
       headers: staticHeaders,
@@ -4115,7 +5969,15 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
       totalRecords,
     });
   } catch (err) {
-    console.error("❌ Error in /get-loans-sanctioned-summary:", err.stack || err);
+   console.error(
+  "LOANS_SANCTIONED_SUMMARY_FAILED",
+  {
+    employeeId: userId,
+    role,
+    level,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       error: "Server error while fetching Loans Sanctioned Summary",
@@ -4132,7 +5994,7 @@ app.post("/get-loans-sanctioned-summary", async (req, res) => {
 // ========================================================================
 //   SIMPLE DEPOSITS → BRANCH LIST BY CLUSTER (For Level-2 Bar Chart)
 // ========================================================================
-app.post("/get-deposits-by-cluster", async (req, res) => {
+app.post("/get-deposits-by-cluster", authMiddleware, async (req, res) => {
   try {
     const { clusterName, userId, role } = req.body;
 
@@ -4223,22 +6085,34 @@ app.post("/get-deposits-by-cluster", async (req, res) => {
 //      SMA — Meaning-Based Dynamic Sorting (FINAL + ADVANCES JOIN + ROW %)
 //============================================================================================
 
-app.post("/get-sma-denormalized", async (req, res) => {
+app.post("/get-sma-denormalized", authMiddleware, async (req, res) => {
   try {
-    let {
-      userId,
-      role,
-      level,
-      designation,
-      filters = {},
-      page = 1,
-      pageSize = 10,
-      sortBy,
-      sortOrder = "ASC",
-    } = req.body;
+let {
+  filters = {},
+  page = 1,
+  pageSize = 10,
+  sortBy,
+  sortOrder = "ASC",
+} = req.body;
 
+let userId = req.user.employeeId;
+const role = req.user.role;
+let level = req.user.level;
+const designation = req.user.designation;
+const branchCodeFromToken = req.user.branchCode;
     console.log("🔹 /get-sma-denormalized called");
-
+console.log(
+  "GET_SMA_DENORMALIZED_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    filters,
+    page,
+    pageSize,
+    sortBy
+  }
+);
     if (userId) {
       userId = parseInt(userId, 10);
     }
@@ -4248,35 +6122,31 @@ app.post("/get-sma-denormalized", async (req, res) => {
     // ------------------------------------------------------
     // Normalize Filters
     // ------------------------------------------------------
-    let branchCode = (filters.branchCode ?? filters.branch_code ?? "").trim();
-    let branchName = (filters.branchName ?? filters.branch_name ?? "").trim();
-    let districtName = (filters.districtName ?? filters.district ?? "").trim();
-    let clusterName = (filters.clusterName ?? filters.cluster ?? "").trim();
+// ⭐ FIXED FILTER PARSING
+let {
+  branchCode,
+  branchName,
+  districtName,
+  clusterName
+} = parseFilters(filters);
+
 
     // ⭐⭐⭐ LEVEL-1 MUST GET branch_code FROM USERS TABLE
-    if (level === "Level 1") {
-      const userBranch = await queryUTIDatabase(
-        `SELECT [Br Code] FROM dbo.employees_master WHERE [Emp No.] = ?`,
-        [userId]
-      );
+if (level === "Level 1") {
+  branchCode = branchCodeFromToken;
 
-      if (!userBranch.length) {
-        return res.status(400).json({
-          success: false,
-          message: "User branch not found for Level 1",
-        });
-      }
+  const num = parseFloat(branchCode);
 
-      branchCode = (userBranch[0]["Br Code"] || "").toString().trim();
+  if (!isNaN(num)) {
+    branchCode = parseInt(num, 10).toString();
+  }
 
-      // Normalize branchCode "2.00" → "2"
-      const num = parseFloat(branchCode);
-      if (!isNaN(num)) {
-        branchCode = parseInt(num, 10).toString();
-      }
+  console.log("✔ Level-1 Branch Code Applied:", branchCode);
+}
 
-      console.log("✔ Level-1 Branch Code Applied:", branchCode);
-    }
+console.log("JWT Branch Code:", branchCodeFromToken);
+console.log("Final Branch Code:", branchCode);
+console.log("Level:", level);
 
     level = level || "Level 1";
     page = Number(page);
@@ -4291,6 +6161,8 @@ app.post("/get-sma-denormalized", async (req, res) => {
 const HIDDEN_SMA_MEANINGS = new Set([
   "sma_fy_accounts",
   "sma_fy_balance",
+  "sma_monthly_accounts",   // 👈 ADD THIS
+  "sma_monthly_balance",    // 👈 ADD THIS
 ]);
 
     //========================================================================================
@@ -4438,8 +6310,8 @@ const mapping = mappingRows
         params.push(value.trim());
         countParams.push(value.trim());
       } else {
-        query += ` AND LOWER(${qualifiedCol}) LIKE ?`;
-        countQuery += ` AND LOWER(${qualifiedCol}) LIKE ?`;
+      query += ` AND LOWER(LTRIM(RTRIM(${qualifiedCol}))) LIKE ?`;
+countQuery += ` AND LOWER(LTRIM(RTRIM(${qualifiedCol}))) LIKE ?`;
         params.push(`%${value.toLowerCase()}%`);
         countParams.push(`%${value.toLowerCase()}%`);
       }
@@ -4455,15 +6327,26 @@ const mapping = mappingRows
       if (match?.[1]) effectiveCluster = match[1].trim();
     }
 
-    if (level === "Level 2") {
-      if (!effectiveCluster) {
-        return res.status(400).json({
-          success: false,
-          message: "Cluster missing for Level 2 user",
-        });
-      }
-      addFilter("cluster", effectiveCluster, true);
-    }
+   if (level === "Level 2") {
+
+  if (!effectiveCluster) {
+
+    await logSecurityEvent(
+      userId,
+      "SMA Access Denied",
+      JSON.stringify({
+        reason: "Cluster missing for Level 2 user"
+      })
+    );
+
+    return res.status(400).json({
+      success: false,
+      message: "Cluster missing for Level 2 user",
+    });
+  }
+
+  addFilter("cluster", effectiveCluster, true);
+}
 
     if (level === "Level 1") {
       addFilter("branch_code", branchCode, true);
@@ -4478,17 +6361,40 @@ const mapping = mappingRows
     // 6️⃣ SORTING
     //========================================================================================
     let orderCol = getCol("branch_code");
+console.log(
+  "SMA_SORT_REQUEST",
+  {
+    sortBy,
+    allowedSortableMeaning
+  }
+);
+let orderExpr =
+`TRY_CAST(LTRIM(RTRIM(s.[${orderCol}])) AS INT)`;
+   if (sortBy && allowedSortableMeaning.includes(sortBy)) {
+  orderCol = getCol(sortBy);
 
-    if (sortBy && allowedSortableMeaning.includes(sortBy)) {
-      orderCol = getCol(sortBy);
-    }
+  const m = mapping.find((x) => x.colName === orderCol);
+
+  if (
+    m &&
+    ["decimal", "int", "number"].includes(
+      String(m.type || "").toLowerCase()
+    )
+  ) {
+    orderExpr = `
+      TRY_CAST(LTRIM(RTRIM(s.[${orderCol}])) AS DECIMAL(18,4))
+    `;
+  } else {
+    orderExpr = `s.[${orderCol}]`;
+  }
+}
 
     const orderDir =
       sortOrder.toUpperCase() === "DESC" ? "DESC" : "ASC";
 
-    query += `
-      ORDER BY TRY_CAST(LTRIM(RTRIM(s.[${orderCol}])) AS DECIMAL(18,4)) ${orderDir}
-    `;
+   query += `
+  ORDER BY ${orderExpr} ${orderDir}
+`;
 
     //========================================================================================
     // 7️⃣ PAGINATION
@@ -4496,14 +6402,35 @@ const mapping = mappingRows
     query += ` OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`;
     params.push(offset, pageSize);
 
+
+console.log("SMA QUERY:");
+console.log(query);
+console.log("PARAMS:");
+console.log(params);
+console.log(
+  "SMA_QUERY_EXECUTION_STARTED",
+  {
+    employeeId: userId
+  }
+);
     //========================================================================================
     // 8️⃣ EXECUTE
     //========================================================================================
     const rows = await queryUTIDatabase(query, params);
+	console.log(
+  "SMA_QUERY_EXECUTION_COMPLETED",
+  {
+    employeeId: userId,
+    rowsReturned: rows.length
+  }
+);
     const totalRecords =
       (await queryUTIDatabase(countQuery, countParams))[0]?.totalRecords || 0;
 
-    const totalPages = Math.ceil(totalRecords / pageSize);
+const totalPages = Math.max(
+  1,
+  Math.ceil(totalRecords / pageSize)
+);
 
     // Helper for numeric safe
     const safeNum = (v) => {
@@ -4600,6 +6527,15 @@ const mapping = mappingRows
     });
 
     const groupedHeaders = Array.from(groupMap.values());
+console.log(
+  "GET_SMA_DENORMALIZED_SUCCESS",
+  {
+    employeeId: userId,
+    rows: data.length,
+    totalRecords,
+    totalPages
+  }
+);
 
     //========================================================================================
     // 1️⃣1️⃣ RESPONSE
@@ -4627,13 +6563,69 @@ const mapping = mappingRows
 //============================================================================================
 //                            SMA TOTAL (MEANING-BASED + FINAL)
 //============================================================================================
-
-app.post("/sma-total", async (req, res) => {
+app.post("/sma-total", authMiddleware, async (req, res) => {
   try {
-    const { level, clusterName } = req.body;
+    let { level, clusterName } = req.body;
+const userId = req.user.employeeId;
+const role = req.user.role;
 
-    const cleanLevel = (level || "").trim().toLowerCase();
-    const cleanCluster = (clusterName || "").trim();
+console.log(
+  "SMA_TOTAL_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    level,
+    clusterName
+  }
+);
+// =====================================================
+// JWT SCOPE ENFORCEMENT
+// =====================================================
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+if (userLevel === "Level 1") {
+console.warn(
+  "SMA_TOTAL_LEVEL1_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+  return res.status(403).json({
+    success: false,
+    message: "Access denied",
+  });
+}
+
+if (userLevel === "Level 2") {
+  level = "Level 2";
+
+  const match = designation?.match(
+    /Cluster\s*Head\s*-\s*(.*)/i
+  );
+
+  if (match) {
+    clusterName = match[1].trim();
+
+    console.log(
+      "SMA_TOTAL_LEVEL2_CLUSTER_RESOLVED",
+      {
+        employeeId: userId,
+        clusterName
+      }
+    );
+  }
+} // LEVEL 2 BLOCK ENDS HERE
+
+console.log("AFTER_LEVEL_CHECK", {
+  userLevel,
+  level,
+  clusterName
+});
+
+const cleanLevel = (level || "").trim().toLowerCase();
+const cleanCluster = (clusterName || "").trim();
 
     // Safe numeric conversion (no formatting here)
     const safe = (v) => {
@@ -4652,6 +6644,12 @@ app.post("/sma-total", async (req, res) => {
     `);
 
     if (!mappingSMA.length) {
+console.warn(
+  "SMA_TOTAL_MAPPING_MISSING",
+  {
+    employeeId: userId
+  }
+);
       return res.json({
         success: false,
         message: "SMA mapping missing. Upload SMA MIS first.",
@@ -4670,6 +6668,13 @@ app.post("/sma-total", async (req, res) => {
     // Validate
     for (let m of [...SMA_BAL, ...SMA_AC]) {
       if (!meaningToCol[m]) {
+console.warn(
+  "SMA_TOTAL_MEANING_MISSING",
+  {
+    employeeId: userId,
+    meaning: m
+  }
+);
         return res.json({
           success: false,
           message: `Meaning '${m}' missing in SMA mapping.`,
@@ -4678,6 +6683,19 @@ app.post("/sma-total", async (req, res) => {
     }
 
     const c = meaningToCol;
+// ----------------------------------
+// Identifier columns
+// ----------------------------------
+const clusterCol =
+  "col" +
+  mappingSMA.find(x => x.meaning === "cluster")?.col_number;
+
+const branchCodeCol =
+  "col" +
+  mappingSMA.find(x => x.meaning === "branch_code")?.col_number;
+
+console.log("cluster mapping =", mappingSMA.find(x => x.meaning === "cluster"));
+console.log("branch mapping =", mappingSMA.find(x => x.meaning === "branch_code"));
 
     //========================================================================================
     // 2️⃣ LOAD ACS MAPPING (to fetch total advances)
@@ -4724,6 +6742,14 @@ app.post("/sma-total", async (req, res) => {
     }
 
     if (!totalAdvances) {
+console.warn(
+  "SMA_TOTAL_ADVANCES_NOT_FOUND",
+  {
+    employeeId: userId,
+    level: cleanLevel,
+    cluster: cleanCluster
+  }
+);
       return res.json({
         success: false,
         message: "Total Advances not found in ACS.",
@@ -4736,28 +6762,48 @@ app.post("/sma-total", async (req, res) => {
     const allSums = [...SMA_BAL, ...SMA_AC]
       .map((m) => `SUM(TRY_CAST([${c[m]}] AS DECIMAL(18,2))) AS [${m}]`)
       .join(",");
+console.log(
+  "SMA_TOTAL_QUERY_STARTED",
+  {
+    employeeId: userId,
+    level: cleanLevel,
+    cluster: cleanCluster || "ALL"
+  }
+);
+
+console.log("cleanLevel =", cleanLevel);
+console.log("cleanCluster =", cleanCluster);
+console.log("clusterCol =", clusterCol);
+console.log("branchCodeCol =", branchCodeCol);
 
     let smaRows = [];
 
-    if (cleanLevel === "grandtotal") {
-      // include all numeric branches
-      const q = `
-        SELECT ${allSums}
-        FROM SMA
-        WHERE ISNUMERIC([${c.branch_code}]) = 1
-      `;
+if (cleanLevel === "grandtotal") {
+  const q = `
+    SELECT ${allSums}
+    FROM SMA
+    WHERE ISNUMERIC([${branchCodeCol}]) = 1
+  `;
       smaRows = await queryUTIDatabase(q);
     } else if (["level 2", "level 3"].includes(cleanLevel)) {
-      const q = `
-        SELECT ${allSums}
-        FROM SMA
-        WHERE UPPER(LTRIM(RTRIM([${c.cluster}]))) = UPPER(?)
-          AND ISNUMERIC([${c.branch_code}]) = 1
-      `;
+  const q = `
+    SELECT ${allSums}
+    FROM SMA
+    WHERE UPPER(LTRIM(RTRIM([${clusterCol}]))) = UPPER(?)
+      AND ISNUMERIC([${branchCodeCol}]) = 1
+  `;
       smaRows = await queryUTIDatabase(q, [cleanCluster]);
     }
 
     if (!smaRows.length) {
+console.warn(
+  "SMA_TOTAL_NO_DATA_FOUND",
+  {
+    employeeId: userId,
+    level: cleanLevel,
+    cluster: cleanCluster
+  }
+);
       return res.json({
         success: false,
         message: "No SMA data found.",
@@ -4792,18 +6838,48 @@ app.post("/sma-total", async (req, res) => {
     SMA_AC.forEach((key) => {
       result[key] = Math.abs(Math.round(safe(row[key]))); // positive integer
     });
+await logActivity(
+  userId,
+  role,
+  "View SMA Summary",
+  `Level=${cleanLevel}, Cluster=${cleanCluster || "ALL"}`
+);
 
+console.log(
+  "VIEW_SMA_SUMMARY_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+console.log(
+  "SMA_TOTAL_SUCCESS",
+  {
+    employeeId: userId,
+    level: cleanLevel,
+    cluster: cleanCluster || "ALL"
+  }
+);
     //========================================================================================
     // 6️⃣ RESPONSE
     //========================================================================================
-    return res.json({
-      success: true,
-      level,
-      cluster: cleanCluster || "ALL",
-      data: result,
-    });
-  } catch (err) {
-    console.error("❌ SMA TOTAL ERROR:", err);
+return res.json({
+  success: true,
+  level,
+  cluster: cleanCluster || "ALL",
+  data: result,
+});
+} catch (err) {
+    console.error(
+  "SMA_TOTAL_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level: req.body?.level,
+    clusterName: req.body?.clusterName,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error in SMA Total",
@@ -4811,15 +6887,22 @@ app.post("/sma-total", async (req, res) => {
     });
   }
 });
-
-
-
-
 //============================================================================================
 //                             UPDATE DAILY SUMMARY  (MEANING-AWARE)
 //============================================================================================
-app.post("/update-daily-summary", async (req, res) => {
+app.post("/update-daily-summary", authMiddleware, async (req, res) => {
   try {
+
+    // =====================================================
+    // ADMIN ONLY
+    // =====================================================
+    if (req.user.role?.toLowerCase() !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     console.log("📩 Incoming request: /update-daily-summary");
 
     // Step 1️⃣: Run dynamic procedure (uses MIS_Column_Mapping meanings internally)
@@ -4921,9 +7004,11 @@ const DAILY_SUMMARY_MEANINGS = {
 };
 
 // ==================== Column Mapping (with UTI connection + meanings) ======================
-app.post("/api/filters", async (req, res) => {
-  const { reportType } = req.body;
-
+app.post("/api/filters", authMiddleware, async (req, res) => {  
+const { reportType } = req.body;
+const userLevel = req.user.level;
+const designation = req.user.designation;
+const userBranchCode = req.user.branchCode;
   try {
     let table = "";
     let section = "";
@@ -5013,7 +7098,7 @@ app.post("/api/filters", async (req, res) => {
 // ============================================================
 //                   DAILY SUMMARY (MEANING-DRIVEN)
 // ============================================================
-app.post("/get-daily-summary", async (req, res) => {
+app.post("/get-daily-summary", authMiddleware, async (req, res) => {
   try {
     const { userId, level, filters = {}, designation, sortBy, sortOrder } =
       req.body;
@@ -5251,7 +7336,7 @@ app.post("/get-daily-summary", async (req, res) => {
 
 // ==================== ✅ Dynamic Sortable Columns Endpoint (DailySummary) ====================
 // ==================== ✅ Dynamic Sortable Columns Endpoint (DailySummary) ====================
-app.get("/get-daily-summary-columns", async (req, res) => {
+app.get("/get-daily-summary-columns", authMiddleware, async (req, res) => {
   try {
     const rows = await queryUTIDatabase(
       `
@@ -5294,10 +7379,16 @@ function cleanNumber(value) {
     .trim();
 }
 
-app.post("/get-daily-summary-trend", async (req, res) => {
+app.post("/get-daily-summary-trend", authMiddleware, async (req, res) => {
   try {
-    const { userId, level, filters = {}, designation } = req.body;
+const { filters = {} } = req.body;
 
+// =====================================================
+// JWT VALUES ONLY
+// =====================================================
+const userId = req.user.employeeId;
+const level = req.user.level;
+const designation = req.user.designation;
     const cleanUserId = cleanNumber(userId);
     const cleanBranchCode = cleanNumber(filters.branchCode);
     const cleanCluster = (filters.clusterName || "").trim();
@@ -5379,18 +7470,71 @@ app.post("/get-daily-summary-trend", async (req, res) => {
 //                        ✅ GENERATE LOANS OPENED
 // ===================================================================================
 
-app.post("/generate-loans-opened-summary", async (req, res) => {
+app.post("/generate-loans-opened-summary", authMiddleware, async (req, res) => {
   try {
 
-    const {
-      branchCode,
-      branchName,
-      clusterName,
-      districtName,
-      page = 1,
-      pageSize = 10,
-      sortBy = null,
-    } = req.body;
+ let {
+  branchCode,
+  branchName,
+  clusterName,
+  districtName,
+  page = 1,
+  pageSize = 10,
+  sortBy = null,
+} = req.body;
+
+const userId = req.user.employeeId;
+const role = req.user.role;
+
+console.log(
+  "GENERATE_LOANS_OPENED_SUMMARY_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    branchCode,
+    branchName,
+    clusterName,
+    districtName,
+    page,
+    pageSize,
+    sortBy
+  }
+);
+
+// =====================================================
+// JWT SCOPE ENFORCEMENT
+// =====================================================
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+if (userLevel === "Level 1") {
+  branchCode = req.user.branchCode;
+
+  console.log(
+    "GENERATE_LOANS_OPENED_SUMMARY_LEVEL1_BRANCH_ENFORCED",
+    {
+      employeeId: userId,
+      branchCode
+    }
+  );
+}
+if (userLevel === "Level 2") {
+  const match = designation?.match(
+    /Cluster\s*Head\s*-\s*(.*)/i
+  );
+
+if (match) {
+  clusterName = match[1].trim();
+
+  console.log(
+    "GENERATE_LOANS_OPENED_SUMMARY_LEVEL2_CLUSTER_RESOLVED",
+    {
+      employeeId: userId,
+      clusterName
+    }
+  );
+}
+}
 
     // -----------------------------------------------------
     // NORMALIZE BRANCH CODE
@@ -5438,10 +7582,31 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
     if (districtName) {
       masterQuery += ` AND LOWER(LTRIM(RTRIM([col3]))) LIKE '%' + LOWER('${districtName.trim()}') + '%'`;
     }
-
+console.log(
+  "GENERATE_LOANS_OPENED_SUMMARY_MASTER_QUERY_STARTED",
+  {
+    employeeId: userId
+  }
+);
     const masterData = await queryUTIDatabase(masterQuery);
 
     if (!masterData || masterData.length === 0) {
+console.warn(
+  "GENERATE_LOANS_OPENED_SUMMARY_NO_BRANCHES_FOUND",
+  {
+    employeeId: userId,
+    branchCode,
+    branchName,
+    clusterName,
+    districtName
+  }
+);
+await logActivity(
+  userId,
+  role,
+  "View Loans Accounts Opened",
+  "No branches found"
+);
       return res.json({
         success: true,
         message: "No branches found matching filters.",
@@ -5466,7 +7631,12 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
       FROM [dbo].[LoansAccountsOpened]
       WHERE [Sanctioned Amount] IS NOT NULL
     `;
-
+console.log(
+  "GENERATE_LOANS_OPENED_SUMMARY_LOAN_QUERY_STARTED",
+  {
+    employeeId: userId
+  }
+);
     const loanData = await queryUTIDatabase(loanQuery);
 
     // -----------------------------------------------------
@@ -5567,7 +7737,13 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
 
       return row;
     });
-
+console.log(
+  "GENERATE_LOANS_OPENED_SUMMARY_SORT_APPLIED",
+  {
+    employeeId: userId,
+    sortBy: sortBy || "Branch Code"
+  }
+);
     // -----------------------------------------------------
     // 7) SORTING
     // -----------------------------------------------------
@@ -5601,7 +7777,28 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
         children: ["A/Cs", "Amount"],
       },
     ];
+await logActivity(
+  userId,
+  role,
+  "View Loans Accounts Opened",
+  `Records=${totalRecords}, Page=${page}`
+);
 
+console.log(
+  "VIEW_LOANS_ACCOUNTS_OPENED_ACTIVITY_LOGGED",
+  {
+    employeeId: userId
+  }
+);
+console.log(
+  "GENERATE_LOANS_OPENED_SUMMARY_SUCCESS",
+  {
+    employeeId: userId,
+    totalRecords,
+    totalPages,
+    page
+  }
+);
     return res.json({
       success: true,
       totalRecords,
@@ -5612,7 +7809,16 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error in /generate-loans-opened-summary:", err);
+   console.error(
+  "GENERATE_LOANS_OPENED_SUMMARY_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    page: req.body?.page,
+    error: err.message,
+    stack: err.stack
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error generating summary",
@@ -5623,19 +7829,16 @@ app.post("/generate-loans-opened-summary", async (req, res) => {
 //============================================================================================
 //                                      BRANCH CONTACTS
 //============================================================================================
-//============================================================================================
-//                                      BRANCH CONTACTS
-//============================================================================================
-app.post("/get-branch-contacts", async (req, res) => {
+app.post("/get-branch-contacts", authMiddleware, async (req, res) => {
   try {
     let { branchCodes = [], filters = {} } = req.body;
 
-    const {
-      clusterName,
-      branchCode,
-      branchName,
-      districtName,
-    } = filters;
+let {
+  clusterName,
+  branchCode,
+  branchName,
+  districtName,
+} = filters;
 
     // ----------------------------------------------------
     // Normalize branchCodes → numeric only
@@ -5667,6 +7870,181 @@ app.post("/get-branch-contacts", async (req, res) => {
         return isNaN(n) ? null : n;
       })
       .filter((v) => v !== null);
+	  
+// =====================================================
+// JWT SCOPE ENFORCEMENT
+// =====================================================
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "GET_BRANCH_CONTACTS_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    userLevel,
+    branchCodes,
+    filters
+  }
+);
+
+// ----------------------------------------------------
+// LEVEL 1
+// ----------------------------------------------------
+if (userLevel === "Level 1") {
+
+    const authorizedBranch = Number(req.user.branchCode);
+
+    const requestedBranches = Array.isArray(branchCodes)
+        ? branchCodes.map(Number)
+        : [Number(branchCodes)];
+
+    const unauthorizedAttempt =
+        requestedBranches.some(
+            b => b !== authorizedBranch
+        );
+
+    if (unauthorizedAttempt) {
+
+        await logActivity(
+            req.user.employeeId,
+            req.user.role,
+            "Blocked Branch IDOR",
+            `Requested=${requestedBranches.join(",")} Allowed=${authorizedBranch}`
+        );
+
+        return res.status(403).json({
+            success: false,
+            message: "Access denied"
+        });
+    }
+
+    // Ignore client supplied values
+    branchCodes = [authorizedBranch];
+    branchCode = authorizedBranch;
+}
+
+
+// ----------------------------------------------------
+// LEVEL 2
+// ----------------------------------------------------
+if (userLevel === "Level 2") {
+
+    // Extract cluster from designation
+    const match =
+        designation?.match(
+            /Cluster\s*Head\s*-\s*(.*)/i
+        );
+
+    if (!match) {
+
+        console.warn(
+            "LEVEL2_CLUSTER_NOT_FOUND",
+            {
+                employeeId: req.user.employeeId,
+                designation
+            }
+        );
+
+        return res.status(403).json({
+            success: false,
+            message: "Cluster mapping not found"
+        });
+    }
+
+    const allowedCluster = match[1].trim();
+	
+	if (!allowedCluster) {
+    return res.status(403).json({
+        success:false,
+        message:"Cluster mapping not found"
+    });
+}
+
+    // Never trust request cluster
+    clusterName = allowedCluster;
+
+    // Fetch branches belonging to cluster
+    const allowedBranches = await queryUTIDatabase(
+        `
+        SELECT branch_code
+        FROM MIS.dbo.Branch_Cluster_Master
+        WHERE cluster_name = ?
+        `,
+        [allowedCluster]
+    );
+
+    const allowedSet = new Set(
+        allowedBranches.map(
+            x => Number(x.branch_code)
+        )
+    );
+// Don't allow branch_name-only requests
+if (
+    branch_name &&
+    (
+      branch_code === null ||
+      branch_code === undefined ||
+      branch_code === ""
+    )
+) {
+
+    await logActivity(
+        req.user.employeeId,
+        req.user.role,
+        "Blocked Glance IDOR",
+        `BranchName=${branch_name}`
+    );
+
+    return res.status(403).json({
+        success:false,
+        message:"Access denied"
+    });
+}
+    // Validate branchCodes[]
+    if (branchCodes.length) {
+
+        const unauthorized =
+            branchCodes.some(
+                b => !allowedSet.has(Number(b))
+            );
+
+        if (unauthorized) {
+
+            await logActivity(
+                req.user.employeeId,
+                req.user.role,
+                "Blocked Branch IDOR",
+                `Requested=${branchCodes.join(",")}`
+            );
+
+            return res.status(403).json({
+                success: false,
+                message: "Access denied"
+            });
+        }
+    }
+
+    // Validate branchCode filter
+    if (
+        branchCode &&
+        !allowedSet.has(Number(branchCode))
+    ) {
+
+        await logActivity(
+            req.user.employeeId,
+            req.user.role,
+            "Blocked BranchCode IDOR",
+            `Requested=${branchCode}`
+        );
+
+        return res.status(403).json({
+            success: false,
+            message: "Access denied"
+        });
+    }
+}
+
 
     // ----------------------------------------------------
     // BASE QUERY (MASTER TABLE IS AUTHORITATIVE)
@@ -5692,7 +8070,7 @@ app.post("/get-branch-contacts", async (req, res) => {
     // ----------------------------------------------------
 
     // 1️⃣ Cluster filter → HIGHEST PRIORITY
-    if (clusterName) {
+  if (clusterName && !branchCodes.length) {
       query += ` AND LTRIM(RTRIM(bcm.cluster_name)) = ?`;
       params.push(clusterName.trim());
     }
@@ -5707,6 +8085,12 @@ app.post("/get-branch-contacts", async (req, res) => {
     }
     // 3️⃣ Safety fallback
     else {
+console.warn(
+  "GET_BRANCH_CONTACTS_NO_FILTERS",
+  {
+    employeeId: req.user?.employeeId
+  }
+);
       return res.json({ data: [] });
     }
 
@@ -5747,24 +8131,69 @@ app.post("/get-branch-contacts", async (req, res) => {
     // ----------------------------------------------------
     let results = [];
     try {
+console.log(
+  "GET_BRANCH_CONTACTS_QUERY_STARTED",
+  {
+    employeeId: req.user?.employeeId,
+    paramsCount: params.length,
+    queryLength: query.length
+  }
+);
       results = await queryUTIDatabase(query, params);
+console.log(
+  "GET_BRANCH_CONTACTS_QUERY_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    records: results.length
+  }
+);
     } catch (dbErr) {
-      console.error("❌ Database query error:", dbErr.stack || dbErr);
+     console.error(
+  "GET_BRANCH_CONTACTS_DB_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    error: dbErr.message
+  }
+);
       return res.status(500).json({ error: "Database query failed" });
     }
+await logActivity(
+  req.user.employeeId,
+  req.user.role,
+  "View Branch Contacts",
+  `Records=${results.length}`
+);
 
+console.log(
+  "VIEW_BRANCH_CONTACTS_ACTIVITY_LOGGED",
+  {
+    employeeId: req.user?.employeeId
+  }
+);
+console.log(
+  "GET_BRANCH_CONTACTS_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    records: results.length
+  }
+);
     // ----------------------------------------------------
     // RETURN RAW DATA
     // ----------------------------------------------------
     return res.json({ data: results });
 
   } catch (err) {
-    console.error("❌ Unexpected error in /get-branch-contacts:", err.stack || err);
+   console.error(
+  "GET_BRANCH_CONTACTS_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
-
 
 // ============================================================================================
 //                                 UPLOAD MIS (DYNAMIC + SMART SORT CHECK)
@@ -5802,6 +8231,8 @@ const sectionTableMap = {
   sma: "SMA",
   "loans accounts opened": "LoansAccountsOpened",
   "daily summary": "DailySummary",
+  "deposits_all": "DOA_Yearly",
+  "rbia audit": "RBIA_Audit_Report",
 };
 
 // CLUSTER SECTION → TABLE
@@ -5817,6 +8248,7 @@ const clusterTableMap = {
 const fixedTableUploadMap = {
   "monthly loan summary": "Monthly_Loan_Summary_Stage",
   "yearly loan summary": "Yearly_Loan_Summary_Stage",
+  "deposits_all": "DOA_Yearly",
 };
 
 // BASIC AUTO-MEANING
@@ -5863,7 +8295,9 @@ const DAO_MEANING_OVERRIDES = {
   "Current A/Cs": "current_accounts",
   "Current Amount": "current_amount",
   Vouchers: "vouchers",
+  "Vouchers Average": "vouchers_average",  
 };
+
 const DAOCS_MEANING_OVERRIDES = {
   "TDR(>=1 LAKH) A/Cs": "tdr_accounts",
   "TDR(>=1 LAKH) Amount": "tdr_amount",
@@ -5874,7 +8308,9 @@ const DAOCS_MEANING_OVERRIDES = {
   "Current A/Cs": "current_accounts",
   "Current Amount": "current_amount",
   Vouchers: "vouchers",
+  "Vouchers Average": "vouchers_average",  
 };
+
 
 // -------- NPACS (Cluster NPA Summary) --------
 const NPACS_MEANING_OVERRIDES = {
@@ -5950,11 +8386,16 @@ SMA: {
     "SMA 1 A/Cs": "sma1_accounts",
     "SMA 2 A/Cs": "sma2_accounts",
   },
-  loanssanctioned: {
+loanssanctioned: {
     "OVER ALL FY from April-2025 A/Cs": "over_all_fy_accounts",
     "OVER ALL FY from April-2025 Amount": "over_all_fy_amount",
-  },
 
+    "On _17-05-2026  A/Cs": "on_date_accounts",
+    "On _17-05-2026  Amount": "on_date_amount",
+
+    "During May-2026 A/Cs": "during_month_accounts",
+    "During May-2026 Amount": "during_month_amount"
+},
   LoansAccountsOpened: {
     Total_Accounts: "total_accounts",
     Total_Amount: "total_amount",
@@ -5999,30 +8440,64 @@ function resolveFinalMeaning(label, tableName) {
 // -------------------------------------------------------------------------
 const lower = trimmed.toLowerCase();
 
-const isFYEnd =
-  /\b31[-\/]03[-\/]\d{4}\b/.test(lower) ||
-  /\b31[-\/]3[-\/]\d{4}\b/.test(lower);
+// FY snapshot column
+if (lower.startsWith("as on")) {
 
-if (isFYEnd) {
-  // Deposits side (Bank + Cluster)
-  if (
-    tableName === "Deposits" ||
-    tableName === "Deposits_history" ||
-    tableName === "DCS"
-  ) {
-    return "as_on_fy_deposits";
-  }
+    const isFYEnd =
+        /\b31[-\/]03[-\/]\d{4}\b/.test(lower) ||
+        /\b31[-\/]3[-\/]\d{4}\b/.test(lower);
 
-  // Advances side (Bank + Cluster)
-  if (
+    if (isFYEnd) {
+
+        if (
+            tableName === "Deposits" ||
+            tableName === "Deposits_history" ||
+            tableName === "DCS"
+        ) {
+            return "as_on_fy_deposits";
+        }
+
+        if (
+            tableName === "Advances" ||
+            tableName === "Advances_history" ||
+            tableName === "ACS"
+        ) {
+            return "as_on_fy_advances";
+        }
+    }
+}
+
+// ----------------------------------------------------
+// ADVANCES MONTHLY SNAPSHOT
+// ----------------------------------------------------
+if (
     tableName === "Advances" ||
     tableName === "Advances_history" ||
     tableName === "ACS"
-  ) {
-    return "as_on_fy_advances";
-  }
-}
+) {
 
+    const hasDate =
+        /\b\d{1,2}[-\/]\d{1,2}[-\/]\d{4}\b/.test(lower);
+
+    const isFYEnd =
+        /\b31[-\/]03[-\/]\d{4}\b/.test(lower);
+
+    if (
+        lower.startsWith("as on") &&
+        hasDate &&
+        !isFYEnd
+    ) {
+        return "as_on_date_advances";
+    }
+
+    if (lower === "amount") {
+        return "amount_advances";
+    }
+
+    if (lower.includes("cy budgeted growth")) {
+        return "cy_budgeted_growth_advances";
+    }
+}
   // -------------------------------------------------------------------------
   // 1️⃣ STRICT — meanings required by update_daily_summary_from_history
   // -------------------------------------------------------------------------
@@ -6169,37 +8644,60 @@ if (
 // -------------------------------------------------------------------------
 // ⭐ LSCS — Loans Sanctioned Cluster Summary (dynamic date headers)
 // -------------------------------------------------------------------------
-if (tableName === "LSCS") {
-  const lower = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+// ⭐ Loans Sanctioned (Bank + Cluster)
+if (
+    tableName === "LSCS" ||
+    tableName === "loanssanctioned"
+) {
 
-  // fix: detect dates even when prefixed with underscore
-  const hasDate = /_?\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/.test(lower);
+    const lower = trimmed
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
 
-  const hasMonthYear =
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[-\s]?\d{2,4}\b/
-      .test(lower);
+    const hasDate =
+        /_?\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/.test(lower);
 
-  // 1️⃣ On <DATE> A/Cs or Amount
-  if ((lower.startsWith("on") || lower.startsWith("on _")) &&
-      (hasDate || hasMonthYear)) {
+    const hasMonthYear =
+        /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[- ]?\d{2,4}\b/
+        .test(lower);
 
-    if (lower.includes("a/c")) return "on_date_accounts";
-    if (lower.includes("amount")) return "on_date_amount";
-  }
+    // On <date>
+    if (
+        (lower.startsWith("on") || lower.startsWith("on _")) &&
+        (hasDate || hasMonthYear)
+    ) {
 
-  // 2️⃣ During <Month-Year> A/Cs or Amount
-  if (lower.startsWith("during") && hasMonthYear) {
-    if (lower.includes("a/c")) return "during_month_accounts";
-    if (lower.includes("amount")) return "during_month_amount";
-  }
+        if (lower.includes("a/c"))
+            return "on_date_accounts";
 
-  // 3️⃣ OVER ALL FY from APRIL-yyyy
-  if (lower.includes("over all fy")) {
-    if (lower.includes("a/c")) return "fy_overall_accounts";
-    if (lower.includes("amount")) return "fy_overall_amount";
-  }
+        if (lower.includes("amount"))
+            return "on_date_amount";
+    }
+
+    // During month
+    if (
+        lower.startsWith("during") &&
+        hasMonthYear
+    ) {
+
+        if (lower.includes("a/c"))
+            return "during_month_accounts";
+
+        if (lower.includes("amount"))
+            return "during_month_amount";
+    }
+
+    // FY
+    if (lower.includes("over all fy")) {
+
+        if (lower.includes("a/c"))
+            return "over_all_fy_accounts";
+
+        if (lower.includes("amount"))
+            return "over_all_fy_amount";
+    }
 }
-
 // -------------------------------------------------------------------------
 // ⭐ CLUSTER SUMMARY — DCS (Deposits Cluster Summary)
 // -------------------------------------------------------------------------
@@ -6358,25 +8856,283 @@ if (tableName === "NPA") {
 // ============================================================================================
 // PART C — MAIN UPLOAD ROUTE (ALIGNED WITH PROCEDURE + MEANING ENGINE)
 // ============================================================================================
+const storage = multer.memoryStorage();
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) =>
-    cb(null, `${Date.now()}${path.extname(file.originalname)}`),
+// 👇 ADD HERE
+const allowedExtensions = [".csv", ".xlsx"];
+
+const ALLOWED_MIME_TYPES = [
+  "text/csv",
+  "text/comma-separated-values",
+  "application/csv",
+  "text/plain",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+];
+
+const upload = multer({
+  storage,
+
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+
+fileFilter: (req, file, cb) => {
+
+  console.log("=================================");
+  console.log("FILE NAME =", file.originalname);
+  console.log("FILE MIME =", file.mimetype);
+  console.log("=================================");
+
+  const ext = path.extname(file.originalname).toLowerCase();
+
+  if (!allowedExtensions.includes(ext)) {
+    return cb(new Error("Only CSV and XLSX files are allowed"));
+  }
+
+  if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+    return cb(new Error("Invalid file MIME type"));
+  }
+
+  cb(null, true);
+},
 });
 
-const upload = multer({ storage });
+const UPLOAD_SIGNATURES = {
+
+ Deposits:{
+  meanings:[
+    "as_on_date_deposits",
+    "change_over_pd_deposits",
+    "gdm_deposits",
+    "gum_deposits"
+  ],
+  identifiers:[
+    "branch_code",
+    "branch_name"
+  ]
+},
+Advances:{
+  meanings:[
+    "as_on_date_advances",
+    "amount_advances",
+    "change_over_pd_advances",
+    "gdm_advances",
+    "gum_advances"
+  ],
+  identifiers:[
+    "branch_code",
+    "branch_name"
+  ]
+},
+  deposits_accounts_opened: {
+    meanings: ["tdr_accounts", "rd_accounts"],
+    identifiers: ["branch_code", "branch_name"]
+  },
+
+  NPA: {
+    meanings: ["stamped_npa_accounts"],
+    identifiers: ["branch_code", "branch_name"]
+  },
+
+  SMA: {
+    meanings: ["sma0_accounts", "sma1_accounts"],
+    identifiers: ["branch_code", "branch_name"]
+  },
+
+  loanssanctioned: {
+    meanings: ["over_all_fy_accounts"],
+    identifiers: ["branch_code", "branch_name"]
+  },
+
+ DCS:{
+  meanings:[
+    "as_on_date",
+    "change_over_pd_deposits",
+    "gdm_deposits",
+    "gum_deposits"
+  ],
+  identifiers:["cluster"]
+},
+
+ ACS:{
+  meanings:[
+    "as_on_date",
+    "change_over_pd_advances",
+    "gdm_advances",
+    "gum_advances"
+  ],
+  identifiers:["cluster"]
+},
+  DAOCS: {
+    meanings: ["tdr_accounts", "rd_accounts"],
+    identifiers: ["cluster"]
+  },
+
+  NPACS: {
+    meanings: ["stamped_npa_accounts"],
+    identifiers: ["cluster"]
+  },
+
+  SMACS: {
+    meanings: ["sma0_accounts", "sma1_accounts"],
+    identifiers: ["cluster"]
+  },
+
+  LSCS: {
+    meanings: ["over_all_fy_accounts"],
+    identifiers: ["cluster"]
+  }
+};
 
 // ============================================================================================
 // MAIN UPLOAD ROUTE
 // ============================================================================================
-app.post("/upload-mis", upload.single("file"), async (req, res) => {
-  const { section, clusterSection, userId, role } = req.body;
+app.post(
+"/upload-mis",
+authMiddleware,
+uploadLimiter,
+upload.single("file"),
+async (req,res)=>{
 
-  if (!req.file)
-    return res.status(400).json({ message: "No file uploaded" });
+  const { section, clusterSection } = req.body;
 
-let tableName;
+  const userId = req.user.employeeId;
+  const role = req.user.role;
+
+console.log(
+  "UPLOAD_MIS_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    section,
+    clusterSection,
+    fileName: req.file?.originalname,
+    fileSize: req.file?.size
+  }
+);
+
+  // =====================================================
+  // ROLE CHECK
+  // =====================================================
+  if (req.user.role?.toLowerCase() !== "admin") {
+console.warn(
+  "UPLOAD_MIS_ACCESS_DENIED",
+  {
+    employeeId: userId,
+    role
+  }
+);
+
+await logSecurityEvent(
+  userId,
+  "MIS Upload Access Denied",
+  JSON.stringify({
+    role
+  })
+);
+    return res.status(403).json({
+      success: false,
+      message: "Access denied",
+    });
+  }
+
+if (!req.file) {
+  console.warn(
+    "UPLOAD_MIS_NO_FILE",
+    {
+      employeeId: userId
+    }
+  );
+
+  return res.status(400).json({
+    message: "No file uploaded"
+  });
+}
+
+// =====================================================
+// FILE SIGNATURE VALIDATION
+// =====================================================
+const fileBuffer = req.file.buffer;
+
+const detectedType = await fileTypeFromBuffer(fileBuffer);
+
+console.log(
+  "UPLOAD_MIS_FILE_VALIDATED",
+  {
+    employeeId: userId,
+    fileName: req.file.originalname,
+    fileSize: req.file.size,
+    detectedMime: detectedType?.mime || "csv"
+  }
+);
+
+// XLSX validation
+if (
+  req.file.originalname.toLowerCase().endsWith(".xlsx")
+) {
+  if (
+    !detectedType ||
+    detectedType.mime !==
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ) {
+   
+console.warn(
+  "UPLOAD_MIS_INVALID_XLSX_SIGNATURE",
+  {
+    employeeId: userId,
+    fileName: req.file.originalname
+  }
+);
+
+await logSecurityEvent(
+  userId,
+  "Invalid XLSX Upload",
+  req.file.originalname
+);
+    return res.status(400).json({
+      success: false,
+      message: "Invalid XLSX file signature",
+    });
+  }
+}
+
+// CSV validation
+if (
+  req.file.originalname.toLowerCase().endsWith(".csv")
+) {
+  const textContent = fileBuffer
+    .toString("utf8")
+    .slice(0, 1000);
+
+  const printableChars =
+    textContent.match(/[\x20-\x7E\r\n\t]/g)?.length || 0;
+
+  const ratio =
+    printableChars / Math.max(textContent.length, 1);
+
+  if (ratio < 0.8) {
+console.warn(
+  "UPLOAD_MIS_INVALID_CSV_SIGNATURE",
+  {
+    employeeId: userId,
+    fileName: req.file.originalname
+  }
+);
+
+await logSecurityEvent(
+  userId,
+  "Invalid CSV Upload",
+  req.file.originalname
+);
+    return res.status(400).json({
+      success: false,
+      message: "Invalid CSV file signature",
+    });
+  }
+}
+
+  let tableName;
 const normalizedSection = section?.toLowerCase().trim();
 
 // 1️⃣ FIXED STRUCTURE TABLES (Monthly / Yearly Loan Summary)
@@ -6397,6 +9153,14 @@ else if (clusterSection) {
 
 // 4️⃣ FINAL VALIDATION
 if (!tableName) {
+console.warn(
+  "UPLOAD_MIS_INVALID_SECTION",
+  {
+    employeeId: userId,
+    section,
+    clusterSection
+  }
+);
   return res.status(400).json({ message: "Invalid section" });
 }
 
@@ -6410,7 +9174,7 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
 
   try {
     const ext = req.file.originalname.toLowerCase();
-    const fileContent = fs.readFileSync(req.file.path);
+  const fileContent = req.file.buffer;
 
     const workbook = XLSX.read(
       ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
@@ -6426,6 +9190,8 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
     }
 
     const fileCols = Object.keys(rows[0]); // EXACT headers
+	
+	
 
     // 1️⃣ Clear stage table (snapshot table)
     await queryUTIDatabase(`DELETE FROM [${tableName}]`);
@@ -6448,14 +9214,29 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
       "Upload MIS Report",
       `Uploaded ${rows.length} rows → ${tableName}`
     );
-
+console.log(
+  "UPLOAD_MIS_FIXED_TABLE_SUCCESS",
+  {
+    employeeId: userId,
+    tableName,
+    uploadedRows: rows.length
+  }
+);
     return res.json({
       success: true,
       message: `${tableName} uploaded successfully`,
       uploaded: rows.length,
     });
   } catch (err) {
-    console.error("❌ Fixed table upload failed:", err);
+  console.error(
+  "UPLOAD_FIXED_TABLE_FAILED",
+  {
+    employeeId: userId,
+    tableName,
+    error: err.message
+  }
+);
+
     return res.status(500).json({
       message: "Error uploading loan summary",
       error: err.message,
@@ -6469,7 +9250,7 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
   if (tableName === "LoansAccountsOpened") {
     try {
       const ext = req.file.originalname.toLowerCase();
-      const fileContent = fs.readFileSync(req.file.path);
+      const fileContent = req.file.buffer;
       const workbook = XLSX.read(
         ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
         { type: ext.endsWith(".csv") ? "string" : "buffer" }
@@ -6534,29 +9315,369 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
         "Upload MIS Report",
         `Uploaded ${rows.length} rows → LoansAccountsOpened`
       );
-
+console.log(
+  "UPLOAD_LOANS_ACCOUNTS_OPENED_SUCCESS",
+  {
+    employeeId: userId,
+    uploadedRows: rows.length
+  }
+);
       return res.json({
         success: true,
         message:
           "LoansAccountsOpened uploaded with real columns + sortable meanings",
       });
     } catch (err) {
-      console.error("❌ Upload LoansAccountsOpened failed:", err);
+  console.error(
+  "UPLOAD_LOANS_ACCOUNTS_OPENED_FAILED",
+  {
+    employeeId: userId,
+    error: err.message
+  }
+);
+
       return res.status(500).json({
         message: "Error uploading LoansAccountsOpened",
         error: err.message,
       });
     }
   }
+// ==========================================================================================
+// DOA YEARLY
+// ==========================================================================================
+if (tableName === "DOA_Yearly") {
 
+  try {
 
+    const ext = req.file.originalname.toLowerCase();
 
+    const fileContent = req.file.buffer;
+
+    const workbook = XLSX.read(
+      ext.endsWith(".csv")
+        ? fileContent.toString("utf8")
+        : fileContent,
+      {
+        type: ext.endsWith(".csv")
+          ? "string"
+          : "buffer"
+      }
+    );
+
+    const rows = XLSX.utils.sheet_to_json(
+      workbook.Sheets[workbook.SheetNames[0]]
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({
+        message: "File empty"
+      });
+    }
+
+    await queryUTIDatabase(`
+      DELETE FROM MIS.dbo.DOA_Yearly
+    `);
+
+    for (const row of rows) {
+
+      await queryUTIDatabase(`
+      INSERT INTO MIS.dbo.DOA_Yearly
+      (
+        [Branch Code],
+        [Branch Name],
+        [District],
+        [Cluster],
+
+        [TDR_A/Cs_Month],
+        [TDR_Bal_Month],
+
+        [RD_A/Cs_Month],
+        [RD_Bal_Month],
+
+        [SB_A/Cs_Month],
+        [SB_Bal_Month],
+
+        [CA_A/Cs_Month],
+        [CA_Bal_Month],
+
+        [TDR_A/Cs_FY],
+        [TDR_Bal_FY],
+
+        [RD_A/Cs_FY],
+        [RD_Bal_FY],
+
+        [SB_A/Cs_FY],
+        [SB_Bal_FY],
+
+        [CA_A/Cs_FY],
+        [CA_Bal_FY]
+      )
+      VALUES
+      (
+        ?,?,?,?,?,?,
+        ?,?,?,?,?,?,
+        ?,?,?,?,?,?,
+        ?,?
+      )
+      `,
+      [
+        row["Branch Code"],
+        row["Branch Name"],
+        row["District"],
+        row["Cluster"],
+
+        row["TDR_A/Cs_Month"],
+        row["TDR_Bal_Month"],
+
+        row["RD_A/Cs_Month"],
+        row["RD_Bal_Month"],
+
+        row["SB_A/Cs_Month"],
+        row["SB_Bal_Month"],
+
+        row["CA_A/Cs_Month"],
+        row["CA_Bal_Month"],
+
+        row["TDR_A/Cs_FY"],
+        row["TDR_Bal_FY"],
+
+        row["RD_A/Cs_FY"],
+        row["RD_Bal_FY"],
+
+        row["SB_A/Cs_FY"],
+        row["SB_Bal_FY"],
+
+        row["CA_A/Cs_FY"],
+        row["CA_Bal_FY"]
+      ]);
+    }
+console.log(
+  "UPLOAD_DOA_YEARLY_SUCCESS",
+  {
+    employeeId: userId,
+    uploadedRows: rows.length
+  }
+);
+    return res.json({
+      success: true,
+      message: `DOA_Yearly uploaded successfully`,
+      uploaded: rows.length
+    });
+
+  } catch (err) {
+console.error(
+  "UPLOAD_DOA_YEARLY_FAILED",
+  {
+    employeeId: userId,
+    error: err.message
+  }
+);
+    return res.status(500).json({
+      message: "DOA upload failed",
+      error: err.message
+    });
+  }
+}
+
+// ==========================================================================================
+// RBIA AUDIT REPORT
+// ==========================================================================================
+// ==========================================================================================
+// RBIA AUDIT REPORT
+// ==========================================================================================
+if (tableName === "RBIA_Audit_Report") {
+
+  try {
+
+    const ext = req.file.originalname.toLowerCase();
+
+    const fileContent = req.file.buffer;
+
+    const workbook = XLSX.read(
+      ext.endsWith(".csv")
+        ? fileContent.toString("utf8")
+        : fileContent,
+      {
+        type: ext.endsWith(".csv")
+          ? "string"
+          : "buffer"
+      }
+    );
+
+    const rows = XLSX.utils.sheet_to_json(
+      workbook.Sheets[workbook.SheetNames[0]]
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({
+        success: false,
+        message: "File empty"
+      });
+    }
+
+    // =====================================================
+    // VALIDATE REQUIRED HEADERS
+    // =====================================================
+
+    const requiredColumns = [
+      "Name of the branch",
+      "Branch Code",
+      "Date of Audit",
+      "Business Risk",
+      "Credit Risk",
+      "Operational Risk",
+      "Overall Score",
+      "Rating"
+    ];
+
+    const fileColumns = Object.keys(rows[0]).map(column =>
+      column
+        .replace(/\r?\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+
+    const missingColumns = requiredColumns.filter(
+      column => !fileColumns.includes(column)
+    );
+
+    if (missingColumns.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Wrong RBIA Audit file. Missing columns: ${missingColumns.join(", ")}`
+      });
+    }
+
+    // =====================================================
+    // CLEAR OLD DATA
+    // =====================================================
+
+    await queryUTIDatabase(`
+      DELETE FROM MIS.dbo.RBIA_Audit_Report
+    `);
+
+    // =====================================================
+    // INSERT NEW DATA
+    // =====================================================
+
+    for (const row of rows) {
+
+      const normalizedRow = {};
+
+      Object.keys(row).forEach(key => {
+        normalizedRow[
+          key
+            .replace(/\r?\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+        ] = row[key];
+      });
+
+      // ===============================================
+      // FORMAT DATE
+      // Supports:
+      // 04.08.2025
+      // Excel Date object
+      // ===============================================
+
+      let auditDate = normalizedRow["Date of Audit"];
+
+      if (auditDate instanceof Date) {
+
+        auditDate = auditDate.toISOString().split("T")[0];
+
+      } else if (typeof auditDate === "string") {
+
+        const parts = auditDate.split(".");
+
+        if (parts.length === 3) {
+          auditDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+        }
+
+      }
+
+      await queryUTIDatabase(
+        `
+        INSERT INTO MIS.dbo.RBIA_Audit_Report
+        (
+          [Name of the branch],
+          [Branch Code],
+          [Date of Audit],
+          [Business Risk],
+          [Credit Risk],
+          [Operational Risk],
+          [Overall Score],
+          [Rating]
+        )
+        VALUES
+        (
+          ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        `,
+        [
+          normalizedRow["Name of the branch"],
+          normalizedRow["Branch Code"],
+          auditDate,
+          normalizedRow["Business Risk"],
+          normalizedRow["Credit Risk"],
+          normalizedRow["Operational Risk"],
+          normalizedRow["Overall Score"],
+          normalizedRow["Rating"]
+        ]
+      );
+
+    }
+
+    // =====================================================
+    // SUCCESS LOGS
+    // =====================================================
+
+    await logActivity(
+      userId,
+      role,
+      "Upload MIS Report",
+      `Uploaded ${rows.length} rows → RBIA_Audit_Report`
+    );
+
+    console.log(
+      "UPLOAD_RBIA_AUDIT_SUCCESS",
+      {
+        employeeId: userId,
+        uploadedRows: rows.length
+      }
+    );
+
+    return res.json({
+      success: true,
+      message: "RBIA Audit uploaded successfully",
+      uploaded: rows.length
+    });
+
+  } catch (err) {
+
+    console.error(
+      "UPLOAD_RBIA_AUDIT_FAILED",
+      {
+        employeeId: userId,
+        error: err.message
+      }
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "RBIA Audit upload failed",
+      error: err.message
+    });
+
+  }
+
+}
   // ==========================================================================================
   // DEFAULT MODE: col1..col30 (Deposits, Advances, NPA, SMA, deposits_accounts_opened, etc.)
   // ==========================================================================================
   try {
     const ext = req.file.originalname.toLowerCase();
-    const fileContent = fs.readFileSync(req.file.path);
+    const fileContent = req.file.buffer;
     const workbook = XLSX.read(
       ext.endsWith(".csv") ? fileContent.toString("utf8") : fileContent,
       { type: ext.endsWith(".csv") ? "string" : "buffer" }
@@ -6572,7 +9693,77 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
 
     if (fileCols.length > 30)
       return res.status(400).json({ message: "Max 30 columns allowed" });
+  
+  if (
+    section === "deposits" &&
+    req.file.originalname.toLowerCase().includes("adv")
+) {
+    return res.status(400).json({
+        success:false,
+        message:"Advances file selected under Deposits"
+    });
+}
 
+if (
+    section === "advances" &&
+    req.file.originalname.toLowerCase().includes("dp")
+) {
+    return res.status(400).json({
+        success:false,
+        message:"Deposits file selected under Advances"
+    });
+}
+
+// ==========================================
+// FILE VALIDATION
+// ==========================================
+
+const fileMeanings = [];
+
+for (const col of fileCols) {
+	
+	console.log(
+  "HEADER:",
+  col,
+  "=>",
+  resolveFinalMeaning(col.trim(), tableName)
+);
+
+  const meaning = resolveFinalMeaning(
+    col.trim(),
+    tableName
+  );
+
+  if (meaning) {
+    fileMeanings.push(meaning);
+  }
+}
+
+console.log("FILE_MEANINGS =", fileMeanings);
+
+const signature = UPLOAD_SIGNATURES[tableName];
+
+if (signature) {
+
+  const meaningsOk =
+    signature.meanings.every(
+      m => fileMeanings.includes(m)
+    );
+
+  const identifiersOk =
+    signature.identifiers.every(
+      m => fileMeanings.includes(m)
+    );
+
+  if (!meaningsOk || !identifiersOk) {
+
+    return res.status(400).json({
+      success: false,
+      message: `Wrong file selected for ${tableName}`
+    });
+
+  }
+}
     // Remove SMA GRAND TOTAL if present
     if (tableName === "SMA") {
       rows = rows.filter((r) => {
@@ -6634,36 +9825,62 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
 
       // 3️⃣ Insert into MIS_Sortable_Columns **ONLY IF** this label
       //    is in SORTABLE_MEANING_OVERRIDES (so grid sort works)
-      const sortableOverride = SORTABLE_MEANING_OVERRIDES[tableName] || {};
-      if (sortableOverride[label]) {
-        sortablePromises.push(
-          queryUTIDatabase(
-            `
-            INSERT INTO MIS.dbo.MIS_Sortable_Columns
-            (section, display_label, meaning)
-            VALUES (?, ?, ?)
-          `,
-            [tableName, label, sortableOverride[label]]
-          )
-        );
-      }
+const sortableMeaning = resolveFinalMeaning(label, tableName);
 
+if (sortableMeaning) {
+
+  sortablePromises.push(
+    queryUTIDatabase(
+      `
+      INSERT INTO MIS.dbo.MIS_Sortable_Columns
+      (
+        section,
+        display_label,
+        meaning
+      )
+      VALUES (?, ?, ?)
+      `,
+      [
+        tableName,
+        label,
+        sortableMeaning
+      ]
+    )
+  );
+
+}
       colIndex++;
     }
 
     await Promise.all([...mappingPromises, ...sortablePromises]);
 
     // Prepare rows in col1..col30 order
-    const dbRows = rows.map((r) => {
-      const ordered = fileCols.map((c) => {
-        const val = r[c];
-        if (val === "" || val === "-") return null;
-        return val;
-      });
-      while (ordered.length < 30) ordered.push(null);
-      return ordered;
-    });
+const dbRows = rows.map((r) => {
+  const ordered = fileCols.map((c) => {
+    let val = r[c];
 
+    // convert dash / blank to NULL
+    if (
+      val === "-" ||
+      val === "" ||
+      val === undefined ||
+      val === null ||
+      val === " - "
+    ) {
+      return null;
+    }
+
+    // remove commas for decimal columns
+    if (typeof val === "string") {
+      val = val.replace(/,/g, "").trim();
+    }
+
+    return val;
+  });
+
+  while (ordered.length < 30) ordered.push(null);
+  return ordered;
+});
     // Clear base tables
     await queryUTIDatabase(`DELETE FROM [${tableName}]`);
 
@@ -6688,34 +9905,77 @@ if (fixedTableUploadMap[section?.toLowerCase()]) {
       "Upload MIS Report",
       `Uploaded ${dbRows.length} rows into ${tableName}`
     );
-
+console.log(
+  "UPLOAD_MIS_ACTIVITY_LOGGED",
+  {
+    employeeId: userId,
+    tableName,
+    uploadedRows: dbRows.length,
+    fileName: req.file.originalname
+  }
+);
+console.log(
+  "UPLOAD_MIS_SUCCESS",
+  {
+    employeeId: userId,
+    tableName,
+    uploadedRows: dbRows.length
+  }
+);
     return res.json({
       success: true,
       message: "MIS uploaded successfully",
       uploaded: dbRows.length,
     });
   } catch (err) {
-    console.error("❌ Upload MIS failed:", err);
-    return res.status(500).json({
-      message: "Server error",
-      error: err.message,
-    });
+console.error(
+  "UPLOAD_MIS_FAILED",
+  {
+    employeeId: userId,
+    tableName,
+    error: err.message
+  }
+);
+  console.error(err);
+
+return res.status(500).json({
+  success:false,
+  message:"Internal server error"
+});
   }
 });
 
 // ============================================================================================
 // PART D — UNIVERSAL SORTABLE COLUMNS ENDPOINT
 // ============================================================================================
-app.post("/get-sortable-columns", async (req, res) => {
+app.post("/get-sortable-columns", authMiddleware, async (req, res) => {
   try {
-    const { section } = req.body;
+const { section } = req.body;
 
-    if (!section) {
-      return res.status(400).json({
-        success: false,
-        message: "Section required",
-      });
+console.log(
+  "GET_SORTABLE_COLUMNS_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    section
+  }
+);
+
+if (!section) {
+
+  console.warn(
+    "GET_SORTABLE_COLUMNS_SECTION_MISSING",
+    {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role
     }
+  );
+
+  return res.status(400).json({
+    success: false,
+    message: "Section required",
+  });
+}
 
     // Example: "deposits" → "Deposits"
     const normalized = section.toLowerCase().trim();
@@ -6732,14 +9992,102 @@ const tableName = sectionTableMap[normalized] || section;
       [tableName]
     );
 
-    // Format into UI-friendly objects
-    const columns = (rows || [])
-      .filter((r) => r.meaning && r.display_label)
-      .map((r) => ({
-        label: r.display_label, // what user sees in dropdown
-        meaning: r.meaning,     // used internally as sortBy value
-      }));
+let filteredRows = rows || [];
 
+// ----------------------
+// SMA
+// ----------------------
+if (tableName === "SMA") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "sma0_accounts",
+      "sma1_accounts",
+      "sma2_accounts"
+    ].includes(r.meaning)
+  );
+}
+
+// ----------------------
+// Deposits
+// ----------------------
+if (tableName === "Deposits") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "change_over_pd_deposits",
+      "gdm_deposits",
+      "gum_deposits",
+      "budget_achieved_deposits"
+    ].includes(r.meaning)
+  );
+}
+
+// ----------------------
+// Deposits Accounts Opened
+// ----------------------
+if (tableName === "deposits_accounts_opened") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "tdr_accounts",
+      "rd_accounts",
+      "savings_accounts",
+      "current_accounts"
+    ].includes(r.meaning)
+  );
+}
+
+// ----------------------
+// Advances
+// ----------------------
+if (tableName === "Advances") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "change_over_pd_advances",
+      "gdm_advances",
+      "gum_advances",
+      "budget_achieved_advances",
+      "cy_budgeted_growth_advances"
+    ].includes(r.meaning)
+  );
+}
+
+// ----------------------
+// NPA
+// ----------------------
+if (tableName === "NPA") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "stamped_npa_accounts",
+      "stamped_npa_balance"
+    ].includes(r.meaning)
+  );
+}
+
+// ----------------------
+// Loans
+// ----------------------
+if (tableName === "loanssanctioned") {
+  filteredRows = filteredRows.filter(r =>
+    [
+      "over_all_fy_accounts",
+      "over_all_fy_amount"
+    ].includes(r.meaning)
+  );
+}
+const columns = filteredRows
+  .filter(r => r.meaning && r.display_label)
+  .map(r => ({
+    label: r.display_label,
+    meaning: r.meaning
+  }));
+console.log(
+  "GET_SORTABLE_COLUMNS_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    section: tableName,
+    columnsCount: columns.length
+  }
+);
     return res.json({
       success: true,
       section: tableName,
@@ -6747,7 +10095,14 @@ const tableName = sectionTableMap[normalized] || section;
     });
 
   } catch (err) {
-    console.error("❌ get-sortable-columns failed:", err);
+  console.error(
+  "GET_SORTABLE_COLUMNS_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error",
@@ -6761,8 +10116,16 @@ const tableName = sectionTableMap[normalized] || section;
  //           Business date
  //=================================================
 
-app.post("/set-as-on-date", async (req, res) => {
+app.post("/set-as-on-date", authMiddleware, async (req, res) => {
   try {
+
+    if (req.user.role?.toLowerCase() !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     const { as_on_date } = req.body;
 
     if (!as_on_date) {
@@ -6797,9 +10160,16 @@ app.post("/set-as-on-date", async (req, res) => {
   }
 });
 
-
-app.post("/get-as-on-date", async (req, res) => {
+//=================GET AS ON DATE====================================
+app.post("/get-as-on-date", authMiddleware, async (req, res) => {
   try {
+console.log(
+  "GET_AS_ON_DATE_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
     const rows = await queryUTIDatabase(
       `
         SELECT as_on_date
@@ -6809,19 +10179,40 @@ app.post("/get-as-on-date", async (req, res) => {
     );
 
     if (!rows || rows.length === 0) {
+console.warn(
+  "GET_AS_ON_DATE_NOT_FOUND",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
       return res.status(404).json({
         success: false,
         message: "As-On Date not found",
       });
     }
-
+console.log(
+  "GET_AS_ON_DATE_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    asOnDate: rows[0].as_on_date
+  }
+);
     return res.json({
       success: true,
       as_on_date: rows[0].as_on_date,
     });
 
   } catch (err) {
-    console.error("❌ Error (get-as-on-date):", err);
+    console.error(
+  "GET_AS_ON_DATE_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error fetching As-On Date",
@@ -6832,8 +10223,32 @@ app.post("/get-as-on-date", async (req, res) => {
 // =====================================================================================
 //                ✅ Fetch Activity Logs (with filters & pagination)
 // ======================================================================================
-app.post("/get-activity-logs", async (req, res) => {
+app.post("/get-activity-logs", authMiddleware, async (req, res) => {
   try {
+console.log(
+  "GET_ACTIVITY_LOGS_API_HIT",
+  {
+    requestedBy: req.user?.employeeId,
+    role: req.user?.role,
+    filters: req.body
+  }
+);
+    if (req.user.role?.toLowerCase() !== "admin") {
+
+  console.warn(
+    "GET_ACTIVITY_LOGS_ACCESS_DENIED",
+    {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role
+    }
+  );
+
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     const { userId, fromDate, toDate, role, action, page = 1, limit = 10 } = req.body;
 
     let sql = `
@@ -6873,10 +10288,24 @@ app.post("/get-activity-logs", async (req, res) => {
     const totalPages = Math.ceil(total / limit);
 
     const logs = await queryUTIDatabase(sql, params);
-
+console.log(
+  "GET_ACTIVITY_LOGS_SUCCESS",
+  {
+    requestedBy: req.user?.employeeId,
+    records: logs.length,
+    page: parseInt(page),
+    totalPages
+  }
+);
     return res.json({ logs, page: parseInt(page), totalPages, total });
   } catch (err) {
-    console.error("❌ Error in /get-activity-logs:", err);
+  console.error(
+  "GET_ACTIVITY_LOGS_FAILED",
+  {
+    requestedBy: req.user?.employeeId,
+    error: err.message
+  }
+);
     return res.status(500).json({ message: "Server error while fetching activity logs" });
   }
 });
@@ -6884,8 +10313,30 @@ app.post("/get-activity-logs", async (req, res) => {
 // ======================================================================================
 //                          ✅ Activity Stats (Date Filter)
 // ======================================================================================
-app.post("/get-activity-stats", async (req, res) => {
+app.post("/get-activity-stats", authMiddleware, async (req, res) => {
   try {
+console.log(
+  "GET_ACTIVITY_STATS_API_HIT",
+  {
+    requestedBy: req.user?.employeeId,
+    role: req.user?.role,
+    filters: req.body
+  }
+);
+    if (req.user.role?.toLowerCase() !== "admin") {
+console.warn(
+  "GET_ACTIVITY_STATS_ACCESS_DENIED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role
+  }
+);
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     const { fromDate, toDate } = req.body;
 
     let whereClause = "";
@@ -6917,7 +10368,15 @@ app.post("/get-activity-stats", async (req, res) => {
 
     const rows = await queryUTIDatabase(sql, params);
     const stats = rows[0] || {};
-
+console.log(
+  "GET_ACTIVITY_STATS_SUCCESS",
+  {
+    requestedBy: req.user?.employeeId,
+    totalLogins: stats.totalLogins || 0,
+    failedLogins: stats.failedLogins || 0,
+    misUploads: stats.misUploads || 0
+  }
+);
     res.json({
       totalLogins: stats.totalLogins || 0,
       failedLogins: stats.failedLogins || 0,
@@ -6926,7 +10385,13 @@ app.post("/get-activity-stats", async (req, res) => {
       lockedAccounts: stats.lockedAccounts || 0,
     });
   } catch (err) {
-    console.error("❌ Error fetching activity stats:", err);
+   console.error(
+  "GET_ACTIVITY_STATS_FAILED",
+  {
+    requestedBy: req.user?.employeeId,
+    error: err.message
+  }
+);
     res.status(500).json({ message: "Server error while fetching activity stats" });
   }
 });
@@ -6934,8 +10399,16 @@ app.post("/get-activity-stats", async (req, res) => {
 // ====================================================================================
 //                         ✅ Fetch Last Activities per User
 // ====================================================================================
-app.post("/get-last-activities", async (req, res) => {
+app.post("/get-last-activities", authMiddleware, async (req, res) => {
   try {
+
+    if (req.user.role?.toLowerCase() !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     const { role } = req.body;
 
     let sql = `
@@ -6966,39 +10439,281 @@ app.post("/get-last-activities", async (req, res) => {
   }
 });
 
-//============================================================================
-//                              AT A GLANCE – MAIN
-//============================================================================
-app.post("/api/glance", async (req, res) => {
-  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
+//===================== UPDATE ALL DEPOSITS ================================
+app.post(
+  "/update-deposits-all",
+  authMiddleware,
+  async (req, res) => {
+    try {
+console.log(
+  "UPDATE_DEPOSITS_ALL_API_HIT",
+  {
+    employeeId: req.user.employeeId,
+    role: req.user.role
+  }
+);
+if (req.user.role !== "admin") {
 
-  try {
-    const pool = await poolPromise;
+  console.warn(
+    "UPDATE_DEPOSITS_ALL_ACCESS_DENIED",
+    {
+      employeeId: req.user.employeeId,
+      role: req.user.role
+    }
+  );
 
-    const resolved = applyLevel1Restriction({
-      userLevel,
-      requestedLevel: level,
-      branch_code,
-      branch_name,
-	  cluster_name,
-    });
+  await logSecurityEvent(
+    req.user.employeeId,
+    "Deposits Update Access Denied",
+    JSON.stringify({
+      role: req.user.role
+    })
+  );
 
-    const request = pool.request();
-    request.input("level", sql.VarChar(10), resolved.level);
-    request.input("branch_code", sql.Int, resolved.branch_code ?? null);
-    request.input("branch_name", sql.VarChar(100), resolved.branch_name ?? null);
-    request.input(
-  "cluster_name",
-  sql.VarChar(50),
-  resolved.level === "CLUSTER" ? resolved.cluster_name : null
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
+console.log(
+  "USP_DEPOSITS_UPDATE_STARTED",
+  {
+    employeeId: req.user.employeeId
+  }
+);
+      await queryUTIDatabase(`
+        EXEC usp_DepositsUpdate
+      `);
+	  
+	  await logActivity(
+  req.user.employeeId,
+  req.user.role,
+  "Deposits Update",
+  "Executed usp_DepositsUpdate"
+);
+console.log(
+  "USP_DEPOSITS_UPDATE_COMPLETED",
+  {
+    employeeId: req.user.employeeId
+  }
+);
+      return res.json({
+        success: true,
+        message: "Deposits Update completed successfully"
+      });
+
+    } catch (err) {
+
+      console.error(
+  "UPDATE_DEPOSITS_ALL_FAILED",
+  {
+    employeeId: req.user.employeeId,
+    error: err.message
+  }
+);
+
+      return res.status(500).json({
+        success: false,
+        message: err.message
+      });
+    }
+  }
 );
 
 
-    const result = await request.execute("get_glance_data");
+//============================================================================
+//                              AT A GLANCE – MAIN
+//============================================================================
+app.post("/api/glance", authMiddleware, async (req, res) => {
+let {
+  level,
+  branch_code,
+  branch_name,
+  cluster_name
+} = req.body;
 
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "GLANCE_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    userLevel,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name
+  }
+);
+
+  try {
+// ==========================================
+// LEVEL 1 - FORCE USER'S OWN BRANCH
+// ==========================================
+const branchCodeFromToken = req.user.branchCode;
+const branchNameFromToken = req.user.branchName;
+
+if (userLevel === "Level 1") {
+    level = "BRANCH";
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    cluster_name = null;
+
+    if (branch_code !== null && branch_code !== undefined) {
+        const numeric = parseFloat(branch_code);
+
+        if (!Number.isNaN(numeric)) {
+            branch_code = parseInt(numeric, 10);
+        }
+    }
+}
+if (userLevel === "Level 2") {
+
+    const match =
+        designation?.match(
+            /Cluster\s*Head\s*-\s*(.*)/i
+        );
+
+    if (!match) {
+
+        return res.status(403).json({
+            success:false,
+            message:"Cluster mapping not found"
+        });
+    }
+
+    const allowedCluster = match[1].trim();
+
+    cluster_name = allowedCluster;
+
+    // fetch branches of cluster
+    const pool = await poolPromise;
+
+    const allowedBranchesResult =
+        await pool.request()
+            .input(
+                "cluster_name",
+                sql.VarChar(50),
+                allowedCluster
+            )
+            .query(`
+                SELECT branch_code
+                FROM MIS.dbo.Branch_Cluster_Master
+                WHERE cluster_name = @cluster_name
+            `);
+
+    const allowedSet =
+        new Set(
+            allowedBranchesResult.recordset.map(
+                x => Number(x.branch_code)
+            )
+        );
+
+    // Validate branch_code
+    if (
+        branch_code &&
+        !allowedSet.has(Number(branch_code))
+    ) {
+
+        await logActivity(
+            req.user.employeeId,
+            req.user.role,
+            "Blocked Glance IDOR",
+            `Requested=${branch_code}`
+        );
+
+        return res.status(403).json({
+            success:false,
+            message:"Access denied"
+        });
+    }
+
+    // no branch selected => cluster view
+    if (!branch_code && !branch_name) {
+
+        level = "CLUSTER";
+    }
+}
+    const pool = await poolPromise;
+	const request = pool.request();
+
+const r = applyLevel1Restriction({
+  userLevel: req.user.level,
+  requestedLevel: level,
+  branch_code,
+  branch_name,
+  cluster_name,
+  designation: req.user.designation,
+});
+console.log(
+  "GLANCE_SCOPE_RESOLVED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    requestedLevel: level,
+    resolvedLevel: r.level,
+    branchCode: r.branch_code,
+    branchName: r.branch_name,
+    clusterName: r.cluster_name
+  }
+);
+   request.input("level", sql.VarChar(10), r.level);
+request.input("branch_code", sql.Int, r.branch_code ?? null);
+request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+request.input(
+  "cluster_name",
+  sql.VarChar(50),
+  r.level === "CLUSTER"
+    ? r.cluster_name
+    : null
+);
+console.log(
+  "GLANCE_SP_EXECUTION_STARTED",
+  {
+    employeeId: req.user?.employeeId,
+    procedure: "get_glance_data",
+    resolvedLevel: r.level
+  }
+);
+    const result = await request.execute("get_glance_data");
+console.log(
+  "GLANCE_SP_EXECUTION_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    card1Rows: result.recordsets?.[0]?.length || 0,
+    card2Rows: result.recordsets?.[1]?.length || 0,
+    card3Rows: result.recordsets?.[2]?.length || 0
+  }
+);
+console.log(
+  "GLANCE_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    resolvedLevel: r.level,
+    card1Available: !!result.recordsets?.[0]?.[0],
+    card2Available: !!result.recordsets?.[1]?.[0],
+    card3Available: !!result.recordsets?.[2]?.[0]
+  }
+);
+await logActivity(
+  req.user.employeeId,
+  req.user.role,
+  "View At A Glance",
+  `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+);
+
+console.log(
+  "VIEW_AT_A_GLANCE_ACTIVITY_LOGGED",
+  {
+    employeeId: req.user?.employeeId
+  }
+);
     res.json({
       success: true,
-      resolvedLevel: resolved.level,
+resolvedLevel: r.level,
       data: {
         card1: result.recordsets?.[0]?.[0] ?? null,
         card2: result.recordsets?.[1]?.[0] ?? null,
@@ -7006,219 +10721,93 @@ app.post("/api/glance", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false });
-  }
-});
 
-
-//======================================================
-//                NPA – AT A GLANCE (SECURE)
-//======================================================
-app.post("/api/glance/npa", async (req, res) => {
-  const { level, branch_code, branch_name, cluster_name,userLevel } = req.body;
-
-  try {
-    const pool = await poolPromise;
-
-    const r = applyLevel1Restriction({
-      userLevel,
-      requestedLevel: level,
-      branch_code,
-      branch_name,
-	  cluster_name,
-    });
-
-    const request = pool.request();
-    request.input("level", sql.VarChar(10), r.level);
-    request.input("branch_code", sql.Int, r.branch_code ?? null);
-    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
-    request.input(
-  "cluster_name",
-  sql.VarChar(50),
-  r.level === "CLUSTER" ? r.cluster_name : null
-);
-
-
-    const result = await request.execute("get_glance_npa_data");
-
-    res.json({ success: true, data: result.recordset || [] });
-  } catch (err) {
-    res.status(500).json({ success: false });
-  }
-});
-
-
-// ===============================
-// SMA – AT A GLANCE (SECURE)
-// ===============================
-app.post("/api/glance/sma", async (req, res) => {
-  const { level, branch_code, branch_name, cluster_name,userLevel } = req.body;
-
-  try {
-    const pool = await poolPromise;
-
-    const r = applyLevel1Restriction({
-      userLevel,
-      requestedLevel: level,
-      branch_code,
-      branch_name,
-	  cluster_name,
-    });
-
-    const request = pool.request();
-    request.input("level", sql.VarChar(10), r.level);
-    request.input("branch_code", sql.Int, r.branch_code ?? null);
-    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
-    request.input(
-  "cluster_name",
-  sql.VarChar(50),
-  r.level === "CLUSTER" ? r.cluster_name : null
-);
-
-    const result = await request.execute("get_glance_sma_data");
-
-    res.json({ success: true, data: result.recordset || [] });
-  } catch {
-    res.status(500).json({ success: false });
-  }
-});
-
-
-// ===============================
-// DOA – AT A GLANCE (CARD 4) – FINAL & STABLE
-// ===============================
-app.post("/api/glance/doa-card4", async (req, res) => {
-  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
-
-  try {
-    const pool = await poolPromise;
-
-    const r = applyLevel1Restriction({
-      userLevel,
-      requestedLevel: level,
-      branch_code,
-      branch_name,
-	  cluster_name,
-    });
-
-    const request = pool.request();
-    request.input("level", sql.VarChar(10), r.level);
-    request.input("branch_code", sql.Int, r.branch_code ?? null);
-    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
-   request.input(
-  "cluster_name",
-  sql.VarChar(50),
-  r.level === "CLUSTER" ? r.cluster_name : null
-);
-
-
-    const result = await request.execute("get_glance_doa_card4");
-
-    const rows = result.recordsets
-      ? result.recordsets.flat()
-      : result.recordset || [];
-
-    // 🔁 RESHAPE FOR UI (UNCHANGED LOGIC)
-    const data = {
-      TDR: { type: "TDR" },
-      RD: { type: "RD" },
-      Savings: { type: "Savings" },
-      Current: { type: "Current" },
-    };
-
-    rows.forEach((r) => {
-      if (r.section === "As on Date") {
-        data.TDR.on_acs = r.tdr_acs;
-        data.TDR.on_amt = r.tdr_amt;
-        data.RD.on_acs = r.rd_acs;
-        data.RD.on_amt = r.rd_amt;
-        data.Savings.on_acs = r.sb_acs;
-        data.Savings.on_amt = r.sb_amt;
-        data.Current.on_acs = r.ca_acs;
-        data.Current.on_amt = r.ca_amt;
+    console.error(
+      "GLANCE_FAILED",
+      {
+        employeeId: req.user?.employeeId,
+        role: req.user?.role,
+        level,
+        error: err.message
       }
+    );
 
-      if (r.section === "Month To Date") {
-        data.TDR.mtd_acs = r.tdr_acs;
-        data.TDR.mtd_amt = r.tdr_amt;
-        data.RD.mtd_acs = r.rd_acs;
-        data.RD.mtd_amt = r.rd_amt;
-        data.Savings.mtd_acs = r.sb_acs;
-        data.Savings.mtd_amt = r.sb_amt;
-        data.Current.mtd_acs = r.ca_acs;
-        data.Current.mtd_amt = r.ca_amt;
-      }
-
-      if (r.section === "Previous Year") {
-        data.TDR.ytd_acs = r.tdr_acs;
-        data.TDR.ytd_amt = r.tdr_amt;
-        data.RD.ytd_acs = r.rd_acs;
-        data.RD.ytd_amt = r.rd_amt;
-        data.Savings.ytd_acs = r.sb_acs;
-        data.Savings.ytd_amt = r.sb_amt;
-        data.Current.ytd_acs = r.ca_acs;
-        data.Current.ytd_amt = r.ca_amt;
-      }
+    res.status(500).json({
+      success: false
     });
-
-    return res.status(200).json({
-      success: true,
-      data: Object.values(data),
-    });
-
-  } catch (err) {
-    console.error("❌ DOA Card4 API error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch DOA Card 4 data",
-    });
-  }
+}
 });
 
 
-
 // ===============================
-// CARD 5 – LOANS OPENED (SECURE, FINAL)
+// GLANCE – NPA
 // ===============================
-app.post("/api/glance/loans-opened", async (req, res) => {
-  const { level, branch_code, branch_name,cluster_name, userLevel } = req.body;
+app.post("/api/glance/npa", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
 
-  try {
-    const pool = await poolPromise;
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
 
-    const r = applyLevel1Restriction({
-      userLevel,
-      requestedLevel: level,
-      branch_code,
-      branch_name,
-	  cluster_name,
-    });
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
 
-    const request = pool.request();
-    request.input("level", sql.VarChar(10), r.level);
-    request.input("branch_code", sql.Int, r.branch_code ?? null);
-    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
-    request.input(
-  "cluster_name",
-  sql.VarChar(50),
-  r.level === "CLUSTER" ? r.cluster_name : null
-);
+  console.log("GLANCE_NPA_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
 
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
 
-    const result = await request.execute("get_glance_loans_card5");
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
 
-    res.json({ success: true, rows: result.recordset || [] });
-  } catch {
-    res.status(500).json({ success: false });
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
   }
-});
 
-// ===============================
-// EMPLOYEE EFFICIENCY – CARD 6
-// ===============================
-app.post("/api/glance/employee-efficiency", async (req, res) => {
-  const { level, branch_code, branch_name, cluster_name, userLevel } = req.body;
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_NPA_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
 
   try {
     const pool = await poolPromise;
@@ -7229,9 +10818,166 @@ app.post("/api/glance/employee-efficiency", async (req, res) => {
       branch_code,
       branch_name,
       cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_NPA_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
     });
 
     const request = pool.request();
+
+    request.input("level", sql.VarChar(10), r.level);
+    request.input(
+      "branch_code",
+      sql.VarChar(20),
+      r.branch_code?.toString() ?? null
+    );
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_NPA_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_npa_data",
+    });
+
+    const result = await request.execute("get_glance_npa_data");
+
+    console.log("GLANCE_NPA_SUCCESS", {
+      employeeId: req.user?.employeeId,
+      rows: result.recordset?.length || 0,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View NPA At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_NPA_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    res.json({
+      success: true,
+      data: result.recordset || [],
+    });
+
+  } catch (err) {
+    console.error("GLANCE_NPA_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// ===============================
+// GLANCE – SMA
+// ===============================
+app.post("/api/glance/sma", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_SMA_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_SMA_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_SMA_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
     request.input("level", sql.VarChar(10), r.level);
     request.input("branch_code", sql.Int, r.branch_code ?? null);
     request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
@@ -7241,94 +10987,848 @@ app.post("/api/glance/employee-efficiency", async (req, res) => {
       r.level === "CLUSTER" ? r.cluster_name : null
     );
 
-    // 🔴 IMPORTANT: CORRECT PROCEDURE NAME
+    console.log("GLANCE_SMA_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_sma_data",
+    });
+
+    const result = await request.execute("get_glance_sma_data");
+
+    console.log("GLANCE_SMA_SUCCESS", {
+      employeeId: req.user?.employeeId,
+      rows: result.recordset?.length || 0,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View SMA At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_SMA_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    res.json({
+      success: true,
+      data: result.recordset || [],
+    });
+
+  } catch (err) {
+    console.error("GLANCE_SMA_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// ===============================
+// DOA – AT A GLANCE (CARD 4) – FINAL & STABLE
+// ===============================
+// ===============================
+// GLANCE – DOA CARD 4
+// ===============================
+app.post("/api/glance/doa-card4", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_DOA_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_DOA_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_DOA_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_DOA_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_doa_card4",
+    });
+
+    const result = await request.execute("get_glance_doa_card4");
+
+    const rows = result.recordsets
+      ? result.recordsets.flat()
+      : result.recordset || [];
+
+    // ===============================
+    // RESHAPE FOR UI
+    // ===============================
+    const data = {
+      TDR: { type: "TDR(≥ 1 LAKH)" },
+      RD: { type: "RD" },
+      Savings: { type: "Savings" },
+      Current: { type: "Current" },
+    };
+
+    rows.forEach((row) => {
+      if (row.section === "As on Date") {
+        data.TDR.on_acs = row.tdr_acs;
+        data.TDR.on_amt = row.tdr_amt;
+        data.RD.on_acs = row.rd_acs;
+        data.RD.on_amt = row.rd_amt;
+        data.Savings.on_acs = row.sb_acs;
+        data.Savings.on_amt = row.sb_amt;
+        data.Current.on_acs = row.ca_acs;
+        data.Current.on_amt = row.ca_amt;
+      }
+
+      if (row.section === "Month To Date") {
+        data.TDR.mtd_acs = row.tdr_acs;
+        data.TDR.mtd_amt = row.tdr_amt;
+        data.RD.mtd_acs = row.rd_acs;
+        data.RD.mtd_amt = row.rd_amt;
+        data.Savings.mtd_acs = row.sb_acs;
+        data.Savings.mtd_amt = row.sb_amt;
+        data.Current.mtd_acs = row.ca_acs;
+        data.Current.mtd_amt = row.ca_amt;
+      }
+
+      if (row.section === "Previous Year") {
+        data.TDR.ytd_acs = row.tdr_acs;
+        data.TDR.ytd_amt = row.tdr_amt;
+        data.RD.ytd_acs = row.rd_acs;
+        data.RD.ytd_amt = row.rd_amt;
+        data.Savings.ytd_acs = row.sb_acs;
+        data.Savings.ytd_amt = row.sb_amt;
+        data.Current.ytd_acs = row.ca_acs;
+        data.Current.ytd_amt = row.ca_amt;
+      }
+    });
+
+    console.log("GLANCE_DOA_SUCCESS", {
+      employeeId: req.user?.employeeId,
+      rows: rows.length,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View DOA At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_DOA_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: Object.values(data),
+    });
+
+  } catch (err) {
+    console.error("GLANCE_DOA_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch DOA Card 4 data",
+    });
+  }
+});
+
+// ===============================
+// GLANCE – LOANS OPENED
+// ===============================
+app.post("/api/glance/loans-opened", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_LOANS_OPENED_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_LOANS_OPENED_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_LOANS_OPENED_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.NVarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_LOANS_OPENED_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_loans_card5",
+    });
+
+    const result = await request.execute("get_glance_loans_card5");
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View Loans Opened At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_LOANS_OPENED_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    console.log("GLANCE_LOANS_OPENED_SUCCESS", {
+      employeeId: req.user?.employeeId,
+      rows: result.recordset?.length || 0,
+    });
+
+    res.json({
+      success: true,
+      rows: result.recordset || [],
+    });
+
+  } catch (err) {
+    console.error("GLANCE_LOANS_OPENED_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+// ===============================
+// GLANCE – EMPLOYEE EFFICIENCY
+// ===============================
+app.post("/api/glance/employee-efficiency", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_EMPLOYEE_EFFICIENCY_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_EMPLOYEE_EFFICIENCY_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_EMPLOYEE_EFFICIENCY_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_EMPLOYEE_EFFICIENCY_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_employee_efficiency",
+    });
+
     const result = await request.execute(
       "get_glance_employee_efficiency"
     );
+
+    console.log("GLANCE_EMPLOYEE_EFFICIENCY_SUCCESS", {
+      employeeId: req.user?.employeeId,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View Employee Efficiency At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_EMPLOYEE_EFFICIENCY_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
 
     res.json({
       success: true,
       data: result.recordset?.[0] || null,
     });
+
   } catch (err) {
-    console.error("❌ Employee Efficiency API error:", err);
-    res.status(500).json({ success: false });
+    console.error("GLANCE_EMPLOYEE_EFFICIENCY_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
   }
 });
+
 // ===============================
-// BUSINESS CORRESPONDENTS – CARD 1 (REUSABLE)
+// GLANCE – BUSINESS CORRESPONDENTS
 // ===============================
-app.post("/api/glance/business-correspondents", async (req, res) => {
-  const { level, branch_code, branch_name, cluster_name } = req.body;
+app.post("/api/glance/business-correspondents", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+    }
+
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  const r = applyLevel1Restriction({
+    userLevel,
+    requestedLevel: level,
+    branch_code,
+    branch_name,
+    cluster_name,
+    designation,
+  });
+
+  console.log("GLANCE_BC_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    resolvedLevel: r.level,
+    branchCode: r.branch_code,
+    branchName: r.branch_name,
+    clusterName: r.cluster_name,
+  });
 
   try {
     const pool = await poolPromise;
     const request = pool.request();
 
-    request.input("level", sql.VarChar(10), level);
-    request.input("branch_code", sql.Int, branch_code ?? null);
-    request.input("branch_name", sql.VarChar(100), branch_name ?? null);
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
     request.input(
       "cluster_name",
       sql.VarChar(50),
-      level === "CLUSTER" ? cluster_name : null
+      r.level === "CLUSTER" ? r.cluster_name : null
     );
+
+    console.log("GLANCE_BC_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_business_correspondents",
+    });
 
     const result = await request.execute(
       "get_glance_business_correspondents"
     );
 
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View BC At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_BC_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    console.log("GLANCE_BC_SUCCESS", {
+      employeeId: req.user?.employeeId,
+    });
+
     res.json({
       success: true,
       data: result.recordset?.[0] || null,
     });
+
   } catch (err) {
-    console.error("❌ BC API error:", err);
-    res.status(500).json({ success: false });
+    console.error("GLANCE_BC_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
   }
 });
-
 // ===============================
 // ATMs – CARD 1 (REUSABLE)
 // ===============================
-app.post("/api/glance/atms", async (req, res) => {
-  const { level, branch_code, branch_name, cluster_name } = req.body;
+app.post("/api/glance/atms", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+    }
+
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  const r = applyLevel1Restriction({
+    userLevel,
+    requestedLevel: level,
+    branch_code,
+    branch_name,
+    cluster_name,
+    designation,
+  });
+
+  console.log("GLANCE_ATM_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    resolvedLevel: r.level,
+    branchCode: r.branch_code,
+    branchName: r.branch_name,
+    clusterName: r.cluster_name,
+  });
 
   try {
     const pool = await poolPromise;
+
     const request = pool.request();
 
-    request.input("level", sql.VarChar(10), level);
-    request.input("branch_code", sql.Int, branch_code ?? null);
-    request.input("branch_name", sql.VarChar(100), branch_name ?? null);
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
     request.input(
       "cluster_name",
       sql.VarChar(50),
-      level === "CLUSTER" ? cluster_name : null
+      r.level === "CLUSTER" ? r.cluster_name : null
     );
 
+    console.log("GLANCE_ATM_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_atms",
+    });
+
     const result = await request.execute("get_glance_atms");
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View ATM At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_ATM_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    console.log("GLANCE_ATM_SUCCESS", {
+      employeeId: req.user?.employeeId,
+    });
 
     res.json({
       success: true,
       data: result.recordset?.[0] || null,
     });
+
   } catch (err) {
-    console.error("❌ ATM API error:", err);
-    res.status(500).json({ success: false });
+    console.error("GLANCE_ATM_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
   }
 });
 // ================================================
 // 🔐 VALIDATE BRANCH ↔ CLUSTER (LEVEL 2 SECURITY)
 // ================================================
-app.post("/api/validate-branch-cluster", async (req, res) => {
-  const { branch_code, branch_name, cluster_name } = req.body;
+app.post("/api/validate-branch-cluster", authMiddleware, async (req, res) => {
+let {
+  level,
+  branch_code,
+  branch_name,
+  cluster_name
+} = req.body;
 
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "VALIDATE_BRANCH_CLUSTER_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    userLevel,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name
+  }
+);
+
+if (userLevel === "Level 2") {
+  const match = designation?.match(
+    /Cluster\s*Head\s*-\s*(.*)/i
+  );
+
+if (match) {
+
+    cluster_name = match[1].trim();
+
+    console.log(
+      "VALIDATE_BRANCH_CLUSTER_CLUSTER_RESOLVED",
+      {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name
+      }
+    );
+}
+
+  // Force CLUSTER only when branch is not selected
+  if (
+    (branch_code === null || branch_code === undefined || branch_code === "") &&
+    !branch_name
+  ) {
+    level = "CLUSTER";
+  }
+}
   if (!cluster_name || (branch_code == null && !branch_name)) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid input",
-    });
+console.warn(
+  "VALIDATE_BRANCH_CLUSTER_INVALID_INPUT",
+  {
+    employeeId: req.user?.employeeId,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name
+  }
+);
+    return res.status(400).json({ success: false, message: "Invalid input" });
   }
 
   try {
@@ -7338,47 +11838,111 @@ app.post("/api/validate-branch-cluster", async (req, res) => {
     let query = `
       SELECT COUNT(*) AS cnt
       FROM Branch_Cluster_Master
-      WHERE cluster_name = @cluster_name
+      WHERE LOWER(LTRIM(RTRIM(cluster_name)))
+            = LOWER(LTRIM(RTRIM(@cluster_name)))
     `;
 
     request.input("cluster_name", sql.VarChar(50), cluster_name);
 
     if (branch_code !== null && branch_code !== undefined) {
-      query += " AND branch_code = @branch_code";
-      request.input("branch_code", sql.Int, branch_code);
+      query += `
+        AND TRY_CAST(LTRIM(RTRIM(branch_code)) AS INT)
+            =
+            TRY_CAST(@branch_code AS INT)
+      `;
+const safeBranchCode = String(branch_code).replace(/,/g, "").trim();
+
+request.input("branch_code", sql.VarChar(50), safeBranchCode);
     } else {
-      query += " AND branch_name = @branch_name";
+      query += `
+        AND LOWER(LTRIM(RTRIM(branch_name)))
+            =
+            LOWER(LTRIM(RTRIM(@branch_name)))
+      `;
       request.input("branch_name", sql.VarChar(100), branch_name);
     }
 
     const result = await request.query(query);
     const count = result.recordset[0].cnt;
 
-if (count === 0) {
-  return res.status(403).json({
-    success: false,
-    message: "Branch does not belong to your cluster",
-  });
-}
+console.log(
+  "VALIDATE_BRANCH_CLUSTER_QUERY_RESULT",
+  {
+    employeeId: req.user?.employeeId,
+    count
+  }
+);
 
-return res.json({ success: true });
+    if (count === 0) {
+console.warn(
+  "VALIDATE_BRANCH_CLUSTER_ACCESS_DENIED",
+  {
+    employeeId: req.user?.employeeId,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name
+  }
+);
+      return res.status(403).json({
+        success: false,
+        message: "Branch does not belong to your cluster",
+      });
+    }
+console.log(
+  "VALIDATE_BRANCH_CLUSTER_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name
+  }
+);
+    return res.json({ success: true });
+
   } catch (err) {
-    console.error("❌ validate-branch-cluster error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Server error",
-    });
+   console.error(
+  "VALIDATE_BRANCH_CLUSTER_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
-app.post("/get-branches-by-cluster", async (req, res) => {
-  const { cluster_name } = req.body;
 
-  if (!cluster_name) {
-    return res.status(400).json({
-      success: false,
-      message: "cluster_name required",
-    });
+app.post("/get-branches-by-cluster", authMiddleware, async (req, res) => {
+let { cluster_name } = req.body;
+
+const userLevel = req.user.level;
+const designation = req.user.designation;
+
+console.log(
+  "GET_BRANCHES_BY_CLUSTER_API_HIT",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    clusterName: cluster_name
   }
+);
+
+if (userLevel === "Level 2") {
+  const match = designation?.match(
+    /Cluster\s*Head\s*-\s*(.*)/i
+  );
+
+  if (match) {
+    cluster_name = match[1].trim();
+console.log(
+  "GET_BRANCHES_BY_CLUSTER_CLUSTER_RESOLVED",
+  {
+    employeeId: req.user?.employeeId,
+    clusterName: cluster_name
+  }
+);
+  }
+}
 
   try {
     const pool = await poolPromise;
@@ -7392,13 +11956,27 @@ app.post("/get-branches-by-cluster", async (req, res) => {
         WHERE cluster_name = @cluster
         ORDER BY branch_name
       `);
-
+console.log(
+  "GET_BRANCHES_BY_CLUSTER_SUCCESS",
+  {
+    employeeId: req.user?.employeeId,
+    clusterName: cluster_name,
+    branchesCount: result.recordset?.length || 0
+  }
+);
     return res.json({
       success: true,
       branches: result.recordset,
     });
   } catch (err) {
-    console.error("❌ get-branches-by-cluster error", err);
+    console.error(
+  "GET_BRANCHES_BY_CLUSTER_FAILED",
+  {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    error: err.message
+  }
+);
     return res.status(500).json({
       success: false,
       message: "Server error",
@@ -7406,6 +11984,3600 @@ app.post("/get-branches-by-cluster", async (req, res) => {
   }
 });
 
+// ===============================
+// GLANCE – VOUCHERS CARD
+// ===============================
+// ===============================
+// GLANCE – VOUCHERS
+// ===============================
+app.post("/api/glance/vouchers", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_VOUCHERS_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_VOUCHERS_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    // Force CLUSTER only when branch is not selected
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_VOUCHERS_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(10), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(50),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_VOUCHERS_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_vouchers",
+    });
+
+    const result = await request.execute("get_glance_vouchers");
+
+    console.log("GLANCE_VOUCHERS_SUCCESS", {
+      employeeId: req.user?.employeeId,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View Vouchers At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_VOUCHERS_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    res.json({
+      success: true,
+      data: result.recordset?.[0] || null,
+    });
+
+  } catch (err) {
+    console.error("GLANCE_VOUCHERS_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// ===============================
+// GLANCE – RBIA AUDIT CARD
+// ===============================
+app.post("/api/glance/rbia-audit", authMiddleware, async (req, res) => {
+  let {
+    level,
+    branch_code,
+    branch_name,
+    cluster_name,
+  } = req.body;
+
+  const userLevel = req.user.level;
+  const designation = req.user.designation;
+
+  // Branch details from authenticated user
+  const branchCodeFromToken = req.user.branchCode;
+  const branchNameFromToken = req.user.branchName;
+
+  console.log("GLANCE_RBIA_AUDIT_API_HIT", {
+    employeeId: req.user?.employeeId,
+    role: req.user?.role,
+    level,
+    branchCode: branch_code,
+    branchName: branch_name,
+    clusterName: cluster_name,
+  });
+
+  // ==========================================
+  // LEVEL 1 - FORCE USER'S OWN BRANCH
+  // ==========================================
+  if (userLevel === "Level 1") {
+    branch_code = branchCodeFromToken;
+    branch_name = branchNameFromToken;
+    level = "BRANCH";
+
+    if (branch_code !== null && branch_code !== undefined) {
+      const numeric = parseFloat(branch_code);
+
+      if (!Number.isNaN(numeric)) {
+        branch_code = parseInt(numeric, 10);
+      }
+    }
+  }
+
+  // ==========================================
+  // LEVEL 2 CLUSTER RESOLUTION
+  // ==========================================
+  if (userLevel === "Level 2") {
+    const match = designation?.match(/Cluster\s*Head\s*-\s*(.*)/i);
+
+    if (match) {
+      cluster_name = match[1].trim();
+
+      console.log("GLANCE_RBIA_AUDIT_CLUSTER_RESOLVED", {
+        employeeId: req.user?.employeeId,
+        clusterName: cluster_name,
+      });
+    }
+
+    if (
+      (branch_code === null ||
+        branch_code === undefined ||
+        branch_code === "") &&
+      !branch_name
+    ) {
+      level = "CLUSTER";
+    }
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    const r = applyLevel1Restriction({
+      userLevel,
+      requestedLevel: level,
+      branch_code,
+      branch_name,
+      cluster_name,
+      designation,
+    });
+
+    console.log("GLANCE_RBIA_AUDIT_SCOPE_RESOLVED", {
+      employeeId: req.user?.employeeId,
+      resolvedLevel: r.level,
+      branchCode: r.branch_code,
+      branchName: r.branch_name,
+      clusterName: r.cluster_name,
+    });
+
+    const request = pool.request();
+
+    request.input("level", sql.VarChar(20), r.level);
+    request.input("branch_code", sql.Int, r.branch_code ?? null);
+    request.input("branch_name", sql.VarChar(150), r.branch_name ?? null);
+    request.input(
+      "cluster_name",
+      sql.VarChar(150),
+      r.level === "CLUSTER" ? r.cluster_name : null
+    );
+
+    console.log("GLANCE_RBIA_AUDIT_SP_STARTED", {
+      employeeId: req.user?.employeeId,
+      procedure: "get_glance_rbia_audit",
+    });
+
+    const result = await request.execute("get_glance_rbia_audit");
+
+    console.log("GLANCE_RBIA_AUDIT_SUCCESS", {
+      employeeId: req.user?.employeeId,
+      records: result.recordset?.length || 0,
+    });
+
+    await logActivity(
+      req.user.employeeId,
+      req.user.role,
+      "View RBIA Audit At A Glance",
+      `Level=${r.level}, Branch=${r.branch_code || "-"}, Cluster=${r.cluster_name || "-"}`
+    );
+
+    console.log("VIEW_RBIA_AUDIT_ACTIVITY_LOGGED", {
+      employeeId: req.user?.employeeId,
+    });
+
+    res.json({
+      success: true,
+      data: result.recordset || [],
+    });
+
+  } catch (err) {
+    console.error("GLANCE_RBIA_AUDIT_FAILED", {
+      employeeId: req.user?.employeeId,
+      role: req.user?.role,
+      error: err.message,
+    });
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+// =====================================================================
+//                              Data Upload
+// =======================================================================
+
+app.post(
+"/api/data-upload",
+authMiddleware,
+uploadLimiter,
+upload.single("file"),
+  async (req, res) => {
+
+const userId = req.user.employeeId;
+const role = req.user.role;
+
+let transaction = null;
+
+console.log(
+  "EMPLOYEE_UPLOAD_API_HIT",
+  {
+    employeeId: userId,
+    role,
+    fileName: req.file?.originalname,
+    fileSize: req.file?.size
+  }
+);
+
+if (role?.toLowerCase() !== "admin") {
+
+  await logSecurityEvent(
+    userId,
+    "Employees Upload Access Denied",
+    JSON.stringify({ role })
+  );
+
+  return res.status(403).json({
+    success: false,
+    message: "Access denied"
+  });
+}
+
+    try {
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a file"
+        });
+      }
+
+      const fileBuffer = req.file.buffer;
+
+const detectedType =
+  await fileTypeFromBuffer(fileBuffer);
+
+if (
+  req.file.originalname
+    .toLowerCase()
+    .endsWith(".xlsx")
+) {
+
+  if (
+    !detectedType ||
+    detectedType.mime !==
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ) {
+
+    await logSecurityEvent(
+      userId,
+      "Invalid Employee XLSX Upload",
+      req.file.originalname
+    );
+
+    return res.status(400).json({
+      success: false,
+      message: "Invalid XLSX file"
+    });
+  }
+}
+
+      const workbook = XLSX.read(
+  fileBuffer,
+  { type: "buffer" }
+);
+
+      const sheet =
+        workbook.Sheets[
+          workbook.SheetNames[0]
+        ];
+
+      const jsonData =
+        XLSX.utils.sheet_to_json(sheet);
+
+      if (jsonData.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Excel file is empty"
+        });
+      }
+
+      // ===========================
+      // COLUMN VALIDATION
+      // ===========================
+
+      const excelColumns =
+  Object.keys(jsonData[0]).map(col =>
+    col
+      .replace(/\n/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+
+      const requiredColumns = [
+  "Emp no",
+  "Employee Name",
+  "Br Code",
+  "Branch Name",
+  "Designation",
+  "Contact Number",
+  "Cluster"
+];
+
+console.log(
+  "EXCEL COLUMNS =",
+  excelColumns
+);
+
+      const missingColumns =
+        requiredColumns.filter(
+          column =>
+            !excelColumns.includes(column)
+        );
+
+      if (missingColumns.length > 0) {
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "Missing Columns : " +
+            missingColumns.join(", ")
+        });
+
+      }
+
+    const pool =
+  await poolPromise;
+
+transaction =
+  new sql.Transaction(pool);
+
+await transaction.begin();
+
+// ===========================
+// DELETE OLD DATA
+// ===========================
+
+console.log("DELETE STARTED");
+
+const deleteResult =
+  await transaction
+  .request()
+  .query(`
+    DELETE FROM employees_master
+  `);
+
+console.log("DELETE COMPLETED");
+
+const countAfterDelete =
+  await transaction.request().query(`
+    SELECT COUNT(*) AS total
+    FROM employees_master
+  `);
+
+console.log(
+  "COUNT AFTER DELETE =",
+  countAfterDelete.recordset[0].total
+);
+
+let insertedCount = 0;
+
+      // ===========================
+      // INSERT NEW DATA
+      // ===========================
+
+      for (const row of jsonData) {
+
+  const cleanRow = {};
+
+  Object.keys(row).forEach(key => {
+
+    const cleanKey = key
+      .replace(/\n/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    cleanRow[cleanKey] = row[key];
+
+  });
+
+  const empId =
+  String(cleanRow["Emp no"] || "").trim();
+
+  if (!empId) continue;
+
+  const empName =
+    String(
+      cleanRow["Employee Name"] || ""
+    ).trim();
+
+  const branchCode =
+    String(
+      cleanRow["Br Code"] || ""
+    ).trim();
+
+  const branchName =
+    String(
+      cleanRow["Branch Name"] || ""
+    ).trim();
+
+  let designation =
+  String(
+    cleanRow["Designation"] || ""
+  ).trim();
+
+// Force Cluster Head designations
+const clusterHeadMap = {
+  "65": "Cluster Head- Krishna",
+  "223": "Cluster Head- Visakhapatnam",
+  "878": "Cluster Head- West Godavari",
+  "446": "Cluster Head- Guntur"
+};
+
+if (clusterHeadMap[empId]) {
+  designation = clusterHeadMap[empId];
+}
+
+  let contactNumber =
+  String(cleanRow["Contact Number"] || "")
+    .replace(/\s+/g, "")
+    .replace(/[-()+]/g, "")
+    .trim();
+
+// Remove country code 91 if present
+if (
+  contactNumber.length > 10 &&
+  contactNumber.startsWith("91")
+) {
+  contactNumber = contactNumber.substring(2);
+}
+
+  let cluster =
+  String(
+    cleanRow["Cluster"] || ""
+  )
+  .trim()
+  .replace(/\s+/g, "")
+  .toUpperCase();
+
+const clusterMap = {
+  K: "Krishna",
+  G: "Guntur",
+  V: "Visakhapatnam",
+  W: "West Godavari",
+  WG: "West Godavari"
+};
+
+cluster =
+  clusterMap[cluster] || cluster;
+
+        await transaction.request()
+
+          .input(
+  "empId",
+  sql.Int,
+  parseInt(empId)
+)
+
+          .input(
+            "empName",
+            sql.VarChar(200),
+            empName
+          )
+
+          .input(
+  "branchCode",
+  sql.Int,
+  parseInt(branchCode)
+)
+
+          .input(
+            "branchName",
+            sql.VarChar(200),
+            branchName
+          )
+
+          .input(
+            "designation",
+            sql.VarChar(100),
+            designation
+          )
+
+          .input(
+            "contactNumber",
+            sql.VarChar(20),
+            contactNumber
+          )
+
+          .input(
+            "cluster",
+            sql.VarChar(100),
+            cluster
+          )
+
+          .query(`
+  INSERT INTO employees_master
+  (
+    [Emp No.],
+    [Employee Name],
+    [Br Code],
+    [Branch Name],
+    [Designation],
+    [Mobile number],
+    [Cluster]
+  )
+  VALUES
+  (
+    @empId,
+    @empName,
+    @branchCode,
+    @branchName,
+    @designation,
+    @contactNumber,
+    @cluster
+  )
+`);
+
+        insertedCount++;
+
+      }
+
+      await transaction.commit();
+
+await logActivity(
+  userId,
+  role,
+  "Upload Employees Master",
+  `Uploaded ${insertedCount} rows`
+);
+
+console.log(
+  "EMPLOYEE_UPLOAD_SUCCESS",
+  {
+    employeeId: userId,
+    uploadedRows: insertedCount
+  }
+);
+
+      return res.json({
+  success: true,
+  message:
+    "File Uploaded Successfully",
+  insertedCount
+});
+
+    } catch (err) {
+
+  if (transaction) {
+
+    try {
+
+      await transaction.rollback();
+
+    } catch (rollbackError) {
+
+      console.error(
+        "ROLLBACK_FAILED",
+        rollbackError.message
+      );
+
+    }
+
+  }
+
+  console.error(
+    "EMPLOYEE_UPLOAD_FAILED",
+    {
+      employeeId: userId,
+      error: err.message
+    }
+  );
+
+  try {
+
+    await logSecurityEvent(
+      userId,
+      "Employees Upload Failed",
+      err.message
+    );
+
+  } catch (logErr) {
+
+    console.error(
+      "SECURITY_LOG_FAILED",
+      logErr.message
+    );
+
+  }
+
+return res.status(500).json({
+    success: false,
+    message: err.message
+  });
+
+}
+
+  }
+);
+
+// ======================================================
+// SYNC EMPLOYEES MASTER → AUTH
+// ======================================================
+app.post(
+  "/sync-employees",
+  authMiddleware,
+  async (req, res) => {
+    try {
+
+      // Only admin can run
+      if (req.user.role?.toLowerCase() !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied"
+        });
+      }
+
+      console.log(
+        "SYNC_EMPLOYEES_API_HIT",
+        {
+          employeeId: req.user.employeeId
+        }
+      );
+
+      await queryUTIDatabase(`
+        EXEC sync_employees_master_and_auth
+      `);
+
+      await logActivity(
+        req.user.employeeId,
+        req.user.role,
+        "Sync Employees",
+        "Executed sync_employees_master_and_auth"
+      );
+
+      console.log(
+        "SYNC_EMPLOYEES_SUCCESS",
+        {
+          employeeId: req.user.employeeId
+        }
+      );
+
+      return res.json({
+        success: true,
+        message: "Employees synchronized successfully"
+      });
+
+    } catch (err) {
+
+      console.error(
+        "SYNC_EMPLOYEES_FAILED",
+        {
+          employeeId: req.user?.employeeId,
+          error: err.message
+        }
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Sync failed",
+        error: err.message
+      });
+    }
+  }
+);
+
+app.use((err, req, res, next) => {
+
+  console.error(
+    "SERVER_ERROR",
+    {
+      message: err.message
+    }
+  );
+
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      success:false,
+      message:"File upload failed"
+    });
+  }
+
+  if (
+    err.message === "Only CSV and XLSX files are allowed" ||
+    err.message === "Invalid file MIME type"
+  ) {
+    return res.status(400).json({
+      success:false,
+      message:err.message
+    });
+  }
+
+  return res.status(500).json({
+    success:false,
+    message:"Internal server error"
+  });
+
+});
+
+
+
+// ==========================================================================================================================================================
+//                                                                        DASHBOARD
+// ==========================================================================================================================================================
+
+
+app.post("/dashboard-login", async (req, res) => {
+  try {
+
+    const {
+  employeeId,
+  password,
+  googleCode,
+  forceLogin = false
+} = req.body;
+
+    const rows = await queryUTIDatabase(
+      `
+SELECT
+    m.[Emp No.],
+    m.[Employee Name],
+    m.[Br Code],
+    m.[Branch Name],
+    m.[Cluster],
+    m.[Designation],
+
+    a.[Password],
+    a.[role],
+    a.[Level],
+    a.[Approval status],
+    a.[GA_Secret],
+
+    ISNULL(a.DashboardSessionVersion, 0)
+      AS DashboardSessionVersion
+
+FROM employees_auth a
+INNER JOIN employees_master m
+ON a.[Emp No.] = m.[Emp No.]
+
+WHERE a.[Emp No.] = ?
+      `,
+      [employeeId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    // Approval Check
+    if (
+      user["Approval status"] !==
+      "approved"
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Account not approved"
+      });
+    }
+
+    // Password Check
+    if (
+      user.Password !== password
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid password"
+      });
+    }
+
+    // Google Authenticator Validation
+if (!user.GA_Secret) {
+  return res.status(400).json({
+    success: false,
+    message: "Google Authenticator is not configured."
+  });
+}
+
+if (!googleCode) {
+  return res.status(400).json({
+    success: false,
+    message: "Google Authenticator code is required."
+  });
+}
+
+const result = speakeasy.totp.verifyDelta({
+  secret: user.GA_Secret,
+  encoding: "base32",
+  token: googleCode,
+  window: 0
+});
+
+if (!result || result.delta !== 0) {
+  return res.status(401).json({
+    success: false,
+    message: "Google Authenticator code has expired or is invalid."
+  });
+}
+
+    console.log(
+      "Dashboard Login",
+      {
+        employeeId,
+        forceLogin,
+        sessionVersion:
+          user.DashboardSessionVersion
+      }
+    );
+
+    // Already Logged In
+    if (
+      user.DashboardSessionVersion > 0 &&
+      !forceLogin
+    ) {
+
+      return res.status(200).json({
+        success: false,
+        alreadyLoggedIn: true,
+        message:
+          "This account is already logged in on another device. Do you want to continue?"
+      });
+
+    }
+
+    // Create New Session Version
+    const newVersion =
+      user.DashboardSessionVersion + 1;
+
+    await queryUTIDatabase(
+      `
+      UPDATE employees_auth
+      SET
+        DashboardSessionVersion = ?,
+        DashboardLastLogin = GETDATE()
+      WHERE [Emp No.] = ?
+      `,
+      [
+        newVersion,
+        employeeId
+      ]
+    );
+
+    const token = jwt.sign(
+      {
+        employeeId:
+          user["Emp No."].toString(),
+
+        role:
+          user.role,
+
+        level:
+          user.Level,
+
+        branchCode:
+          user["Br Code"],
+
+        designation:
+          user.Designation,
+
+        dashboard: true,
+
+        sessionVersion:
+          newVersion
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "8h"
+      }
+    );
+
+    return res.status(200).json({
+  success: true,
+  token,
+
+  userId: user["Emp No."],
+
+  role: user.role,
+
+  employeeName: user["Employee Name"],
+
+  branchCode: user["Br Code"],
+
+  branchName: user["Branch Name"],
+
+  clusterName: user["Cluster"],
+
+  designation: user.Designation,
+
+  level: user.Level,
+
+  message: `Welcome ${user["Employee Name"]}`
+});
+
+  } catch (err) {
+
+    console.error(
+      "Dashboard Login Error:",
+      err
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Server Error"
+    });
+
+  }
+});
+
+
+app.post(
+  "/dashboard-logout",
+  async (req, res) => {
+
+    try {
+
+      const authHeader =
+        req.headers.authorization;
+
+      if (!authHeader) {
+        return res.status(401).json({
+          message: "Login required"
+        });
+      }
+
+      const token =
+        authHeader.split(" ")[1];
+
+      const decoded =
+        jwt.verify(
+          token,
+          process.env.JWT_SECRET
+        );
+
+      await queryUTIDatabase(
+        `
+        UPDATE employees_auth
+        SET DashboardSessionVersion = 0
+        WHERE [Emp No.] = ?
+        `,
+        [
+          decoded.employeeId
+        ]
+      );
+
+      console.log(
+        "DASHBOARD_LOGOUT_SUCCESS",
+        decoded.employeeId
+      );
+
+      return res.json({
+        success: true
+      });
+
+    } catch (err) {
+
+      console.error(
+        "DASHBOARD_LOGOUT_FAILED",
+        err
+      );
+
+      return res.status(401).json({
+        message: "Logout failed"
+      });
+
+    }
+  }
+);
+
+
+//------------------------------------------------------
+// At A Glance Export Excel
+//------------------------------------------------------
+app.post("/api/glance/export", authMiddleware, async (req, res) => {
+
+    let {
+        level,
+        branch_code,
+        branch_name,
+        cluster_name
+    } = req.body;
+
+    try {
+
+        //-----------------------------------------
+        // Apply Existing Role Restriction
+        //-----------------------------------------
+
+        const r = applyLevel1Restriction({
+
+            userLevel: req.user.level,
+
+            requestedLevel: level,
+
+            branch_code,
+
+            branch_name,
+
+            cluster_name,
+
+            designation: req.user.designation
+
+        });
+
+        console.log(
+            "GLANCE_EXPORT_STARTED",
+            {
+                employeeId: req.user.employeeId,
+                role: req.user.role,
+                level: r.level,
+                branch: r.branch_code,
+                cluster: r.cluster_name
+            }
+        );
+
+        //-----------------------------------------
+        // Database Connection
+        //-----------------------------------------
+
+        const pool = await poolPromise;
+
+        //-----------------------------------------
+        // Create Excel Workbook
+        //-----------------------------------------
+
+        const workbook = new ExcelJS.Workbook();
+		
+		//------------------------------------------------------
+// EXCEL FORMAT HELPERS
+//------------------------------------------------------
+
+function formatNumber(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === "" ||
+        value === "-"
+    ) {
+        return "-";
+    }
+
+    const num =
+Number(String(value).replace(/,/g,""));
+
+if(isNaN(num) || num===0){
+    return "-";
+}
+
+    if (isNaN(num)) {
+        return value;
+    }
+
+    return num.toLocaleString("en-IN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    });
+
+}
+
+function formatAccounts(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === "" ||
+        value === "-"
+    ) {
+        return "-";
+    }
+
+    const num = parseInt(value, 10);
+    if(isNaN(num) || num===0){
+    return "-";
+}
+
+    if (isNaN(num)) {
+        return "-";
+    }
+
+    return num.toLocaleString("en-IN");
+
+}
+
+function formatSmaAmount(value){
+
+    if(
+        value===null ||
+        value===undefined ||
+        value===""){
+        return "-";
+    }
+
+    const num =
+    Number(String(value).replace(/,/g,""));
+
+    if(isNaN(num) || num===0){
+    return "-";
+}
+
+    if(isNaN(num))
+        return "-";
+
+    return (num/100000)
+    .toLocaleString("en-IN",{
+
+        minimumFractionDigits:2,
+        maximumFractionDigits:2
+
+    });
+
+}
+
+function formatChangeOverPdBalance(value){
+
+    if(
+        value===null||
+        value===undefined||
+        value===""
+    ){
+        return "-";
+    }
+
+    let num=Math.abs(
+        Number(
+            String(value).replace(/,/g,"")
+        )
+    );
+
+    if(isNaN(num) || num===0){
+    return "-";
+}
+
+    if(isNaN(num)){
+        return "-";
+    }
+
+    return (num/100000).toLocaleString(
+        "en-IN",
+        {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+        }
+    );
+}
+
+function isNegative(value){
+
+    const num =
+    Number(String(value).replace(/,/g,""));
+
+    return !isNaN(num) && num<0;
+
+}
+
+function isPositive(value){
+
+    const num =
+    Number(String(value).replace(/,/g,""));
+
+    return !isNaN(num) && num>0;
+
+}
+
+        workbook.creator = "Coastal Local Area Bank Ltd.";
+
+        workbook.created = new Date();
+
+//------------------------------------------------------
+// Execute Main Stored Procedure
+//------------------------------------------------------
+
+const request =
+    pool.request();
+
+request.input(
+    "level",
+    sql.VarChar(10),
+    r.level
+);
+
+request.input(
+    "branch_code",
+    sql.Int,
+    r.branch_code ?? null
+);
+
+request.input(
+    "branch_name",
+    sql.VarChar(100),
+    r.branch_name ?? null
+);
+
+request.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level === "CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const result =
+    await request.execute(
+        "get_glance_data"
+    );
+
+const card1 =
+    result.recordsets?.[0]?.[0] || {};
+
+const card2 =
+    result.recordsets?.[1]?.[0] || {};
+	
+	
+	//------------------------------------------------------
+// Information Sheet
+//------------------------------------------------------
+
+const infoSheet =
+workbook.addWorksheet(
+    r.level === "BRANCH"
+        ? "Branch Information"
+        : "Cluster Information"
+);
+
+infoSheet.columns = [
+
+{header:"Field",key:"field",width:30},
+
+{header:"Value",key:"value",width:40}
+
+];
+
+if(r.level==="BRANCH"){
+
+infoSheet.addRows([
+
+{
+field:"Branch Code",
+value:card1.branch_code
+},
+
+{
+field:"Branch Name",
+value:card1.branch_name
+},
+
+{
+field:"Cluster",
+value:card1.cluster_name
+},
+
+{
+field:"Branch Manager",
+value:card1.branch_manager_name
+},
+
+{
+field:"BM Mobile",
+value:card1.branch_manager_contact
+},
+
+{
+field:"No Of Staff",
+value:card1.branch_staff_count
+}
+
+]);
+
+}
+else{
+
+infoSheet.addRows([
+
+{
+field:"Cluster",
+value:card1.cluster_name
+},
+
+{
+field:"Cluster Head",
+value:card1.cluster_head_name
+},
+
+{
+field:"Mobile",
+value:card1.cluster_head_contact
+},
+
+{
+field:"Branches",
+value:card1.cluster_branch_count
+},
+
+{
+field:"Staff",
+value:card1.cluster_staff_count
+}
+
+]);
+
+}
+
+//------------------------------------------------------
+// RBIA AUDIT REPORT
+// BRANCH LEVEL ONLY
+//------------------------------------------------------
+
+if (r.level === "BRANCH") {
+
+    //------------------------------------------------------
+    // FETCH RBIA AUDIT DATA
+    //------------------------------------------------------
+
+    const rbiaRequest = pool.request();
+
+    rbiaRequest.input(
+        "level",
+        sql.VarChar(10),
+        r.level
+    );
+
+    rbiaRequest.input(
+        "branch_code",
+        sql.Int,
+        r.branch_code ?? null
+    );
+
+    rbiaRequest.input(
+        "branch_name",
+        sql.VarChar(100),
+        r.branch_name ?? null
+    );
+
+    rbiaRequest.input(
+        "cluster_name",
+        sql.VarChar(50),
+        null
+    );
+
+    const rbiaResult =
+        await rbiaRequest.execute(
+            "get_glance_rbia_audit"
+        );
+
+    const rbiaData =
+        rbiaResult.recordset || [];
+
+    //------------------------------------------------------
+    // CREATE RBIA AUDIT SHEET
+    //------------------------------------------------------
+
+    if (rbiaData.length > 0) {
+
+        const rbiaSheet =
+            workbook.addWorksheet(
+                "RBIA Audit Report"
+            );
+
+        //------------------------------------------------------
+        // TITLE
+        //------------------------------------------------------
+
+        rbiaSheet.mergeCells("A1:B1");
+
+        const rbiaTitle =
+            rbiaSheet.getCell("A1");
+
+        rbiaTitle.value =
+            "RBIA Audit Report";
+
+        rbiaTitle.font = {
+            bold: true,
+            size: 16,
+            color: {
+                argb: "FFFFFFFF"
+            }
+        };
+
+        rbiaTitle.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: {
+                argb: "1E40AF"
+            }
+        };
+
+        rbiaTitle.alignment = {
+            horizontal: "center",
+            vertical: "middle"
+        };
+
+        rbiaSheet.getRow(1).height = 24;
+
+        //------------------------------------------------------
+        // HEADER
+        //------------------------------------------------------
+
+        rbiaSheet.addRow([
+            "Particulars",
+            "Details"
+        ]);
+
+        const rbiaHeader =
+            rbiaSheet.getRow(2);
+
+        rbiaHeader.font = {
+            bold: true,
+            color: {
+                argb: "FFFFFFFF"
+            }
+        };
+
+        rbiaHeader.eachCell(cell => {
+
+            cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: {
+                    argb: "1E40AF"
+                }
+            };
+
+            cell.alignment = {
+                horizontal: "center",
+                vertical: "middle"
+            };
+
+        });
+
+        //------------------------------------------------------
+        // DATA
+        //------------------------------------------------------
+
+        rbiaData.forEach(row => {
+
+            //--------------------------------------------------
+            // FORMAT AUDIT DATE
+            //--------------------------------------------------
+
+            let auditDate =
+                row["Date of Audit"];
+
+            if (auditDate) {
+
+                const date =
+                    new Date(auditDate);
+
+                if (!isNaN(date.getTime())) {
+
+                    auditDate =
+                        date.toLocaleDateString(
+                            "en-GB"
+                        );
+
+                }
+
+            } else {
+
+                auditDate = "-";
+
+            }
+
+            //--------------------------------------------------
+            // BRANCH NAME / CODE FALLBACK
+            //--------------------------------------------------
+
+            const branchName =
+                row["Name of the branch"] ||
+                row["Name of the Branch"] ||
+                row.branch_name ||
+                card1.branch_name ||
+                "-";
+
+            const branchCode =
+                row["Branch Code"] ??
+                row.branch_code ??
+                card1.branch_code ??
+                r.branch_code ??
+                "-";
+
+            //--------------------------------------------------
+            // RBIA ROWS
+            //--------------------------------------------------
+
+            const rbiaRows = [
+
+                [
+                    "Name of the Branch",
+                    branchName
+                ],
+
+                [
+                    "Branch Code",
+                    branchCode
+                ],
+
+                [
+                    "Date of Audit",
+                    auditDate
+                ],
+
+                [
+                    "Business Risk",
+                    row["Business Risk"] ?? "-"
+                ],
+
+                [
+                    "Credit Risk",
+                    row["Credit Risk"] ?? "-"
+                ],
+
+                [
+                    "Operational Risk",
+                    row["Operational Risk"] ?? "-"
+                ],
+
+                [
+                    "Overall Score",
+                    row["Overall Score"] ?? "-"
+                ],
+
+                [
+                    "Rating",
+                    row["Rating"] || "-"
+                ]
+
+            ];
+
+            //--------------------------------------------------
+            // ADD ROWS TO SHEET
+            //--------------------------------------------------
+
+            rbiaRows.forEach(item => {
+
+                const excelRow =
+                    rbiaSheet.addRow(item);
+
+                // Particulars
+                excelRow.getCell(1).alignment = {
+                    horizontal: "left",
+                    vertical: "middle"
+                };
+
+                excelRow.getCell(1).font = {
+                    bold: true
+                };
+
+                // Details
+                excelRow.getCell(2).alignment = {
+                    horizontal: "right",
+                    vertical: "middle"
+                };
+
+                excelRow.getCell(2).font = {
+                    bold: true
+                };
+
+            });
+
+        });
+
+        //------------------------------------------------------
+        // COLUMN WIDTHS
+        //------------------------------------------------------
+
+        rbiaSheet.getColumn(1).width = 30;
+
+        rbiaSheet.getColumn(2).width = 25;
+
+        //------------------------------------------------------
+        // BORDERS
+        //------------------------------------------------------
+
+        rbiaSheet.eachRow(row => {
+
+            row.eachCell(cell => {
+
+                cell.border = {
+
+                    top: {
+                        style: "thin"
+                    },
+
+                    left: {
+                        style: "thin"
+                    },
+
+                    bottom: {
+                        style: "thin"
+                    },
+
+                    right: {
+                        style: "thin"
+                    }
+
+                };
+
+            });
+
+        });
+
+    }
+
+}
+
+//------------------------------------------------------
+// DEPOSITS & ADVANCES
+//------------------------------------------------------
+
+const depositsSheet =
+workbook.addWorksheet("Deposits & Advances");
+
+// Title
+
+depositsSheet.mergeCells("A1:C1");
+
+const depositsTitle =
+depositsSheet.getCell("A1");
+
+depositsTitle.value = "Deposits & Advances";
+
+depositsTitle.font = {
+    bold: true,
+    size: 16,
+    color: {
+        argb: "FFFFFFFF"
+    }
+};
+
+depositsTitle.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: {
+        argb: "1E40AF"
+    }
+};
+
+depositsTitle.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+depositsSheet.getRow(1).height = 24;
+
+//------------------------------------------------------
+// Header
+//------------------------------------------------------
+
+depositsSheet.addRow([
+    "Sections",
+    "Deposits",
+    "Advances"
+]);
+
+const header =
+depositsSheet.getRow(2);
+
+header.height = 22;
+
+header.font = {
+    bold: true,
+    color: {
+        argb: "FFFFFFFF"
+    }
+};
+
+header.eachCell(cell=>{
+
+cell.fill={
+
+type:"pattern",
+
+pattern:"solid",
+
+fgColor:{argb:"1E40AF"}
+
+};
+
+});
+
+header.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//------------------------------------------------------
+// Data
+//------------------------------------------------------
+
+const depositRows = [
+
+{
+section:"As On Date",
+deposit:card2.as_on_date_deposits,
+advance:card2.as_on_date_advances
+},
+
+{
+section:"Change Over PD",
+deposit:card2.change_over_pd_deposits,
+advance:card2.change_over_pd_advances
+},
+
+{
+section:"GDM",
+deposit:card2.gdm_deposits,
+advance:card2.gdm_advances
+},
+
+{
+section:"GUM",
+deposit:card2.gum_deposits,
+advance:card2.gum_advances
+},
+
+{
+section:"Budget %",
+deposit:card2.budget_achieved_deposits,
+advance:card2.budget_achieved_advances
+}
+
+];
+
+depositRows.forEach(r=>{
+
+const row =
+depositsSheet.addRow([
+
+r.section,
+
+formatNumber(r.deposit),
+
+formatNumber(r.advance)
+
+]);
+
+row.getCell(1).alignment={
+horizontal:"center"
+};
+
+row.getCell(2).alignment={
+horizontal:"right"
+};
+
+row.getCell(3).alignment={
+horizontal:"right"
+};
+
+// Deposit Color
+
+if(Number(r.deposit)<0){
+
+row.getCell(2).font={
+
+color:{
+argb:"DC2626"
+},
+
+bold:true
+
+};
+
+}else{
+
+row.getCell(2).font={
+
+color:{
+argb:"111827"
+},
+
+bold:true
+
+};
+
+}
+
+// Advance Color
+
+if(Number(r.advance)<0){
+
+row.getCell(3).font={
+
+color:{
+argb:"DC2626"
+},
+
+bold:true
+
+};
+
+}else{
+
+row.getCell(3).font={
+
+color:{
+argb:"111827"
+},
+
+bold:true
+
+};
+
+}
+
+});
+
+//------------------------------------------------------
+// Column Width
+//------------------------------------------------------
+
+depositsSheet.getColumn(1).width=28;
+
+depositsSheet.getColumn(2).width=20;
+
+depositsSheet.getColumn(3).width=20;
+
+//------------------------------------------------------
+// Borders
+//------------------------------------------------------
+
+depositsSheet.eachRow(row=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+});
+
+});
+
+//------------------------------------------------------
+// NPA DATA
+//------------------------------------------------------
+
+const npaRequest = pool.request();
+
+npaRequest.input("level", sql.VarChar(10), r.level);
+npaRequest.input("branch_code", sql.VarChar(20), r.branch_code?.toString() ?? null);
+npaRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+npaRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level === "CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const npaResult =
+await npaRequest.execute(
+    "get_glance_npa_data"
+);
+
+const npaData =
+npaResult.recordset || [];
+
+//------------------------------------------------------
+// SMA DATA
+//------------------------------------------------------
+
+const smaRequest = pool.request();
+
+smaRequest.input("level", sql.VarChar(10), r.level);
+smaRequest.input("branch_code", sql.Int, r.branch_code ?? null);
+smaRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+smaRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level === "CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const smaResult =
+await smaRequest.execute(
+    "get_glance_sma_data"
+);
+
+const smaData =
+smaResult.recordset || [];
+
+//------------------------------------------------------
+// Convert NPA
+//------------------------------------------------------
+
+const card3 = {
+
+    asOnAccounts:"-",
+    asOnBalance:"-",
+
+    pdAccounts:"-",
+    pdBalance:"-",
+
+    monthAccounts:"-",
+    monthBalance:"-",
+
+    prevAccounts:"-",
+    prevBalance:"-",
+
+    percentage:"-"
+
+};
+
+npaData.forEach(r=>{
+
+    switch(r.section){
+
+        case "As on Date":
+
+            card3.asOnAccounts=r.npa_accounts;
+            card3.asOnBalance=r.npa_balance;
+
+            break;
+
+        case "Change over PD":
+
+            card3.pdAccounts=r.npa_accounts;
+            card3.pdBalance=r.npa_balance;
+
+            break;
+
+        case "Month To Date":
+
+            card3.monthAccounts=r.npa_accounts;
+            card3.monthBalance=r.npa_balance;
+
+            break;
+
+        case "Previous Year":
+
+            card3.prevAccounts=r.npa_accounts;
+            card3.prevBalance=r.npa_balance;
+
+            break;
+
+        case "% of Advances (As on Date)":
+
+            card3.percentage=r.npa_balance;
+
+            break;
+
+    }
+
+});
+
+//------------------------------------------------------
+// Convert SMA
+//------------------------------------------------------
+
+const sma = {
+
+    asOnAccounts:"-",
+    asOnBalance:"-",
+
+    pdAccounts:"-",
+    pdBalance:"-",
+
+    monthAccounts:"-",
+    monthBalance:"-",
+
+    prevAccounts:"-",
+    prevBalance:"-",
+
+    percentage:"-"
+
+};
+
+smaData.forEach(r=>{
+
+    switch(r.section){
+
+        case "As on Date":
+
+            sma.asOnAccounts=r.acc;
+            sma.asOnBalance=r.bal;
+
+            break;
+
+        case "Change over PD":
+
+            sma.pdAccounts=r.acc;
+            sma.pdBalance=r.bal;
+
+            break;
+
+        case "Month To Date":
+
+            sma.monthAccounts=r.acc;
+            sma.monthBalance=r.bal;
+
+            break;
+
+        case "Previous Year":
+
+            sma.prevAccounts=r.acc;
+            sma.prevBalance=r.bal;
+
+            break;
+
+        case "% of Advances (As on Date)":
+
+            sma.percentage=r.bal;
+
+            break;
+
+    }
+
+});
+
+//------------------------------------------------------
+// NPA & SMA SHEET
+//------------------------------------------------------
+
+const npaSheet =
+workbook.addWorksheet("NPA & SMA");
+
+//-----------------------------------------
+// TITLE
+//-----------------------------------------
+
+npaSheet.mergeCells("A1:E1");
+
+const npaTitle =
+npaSheet.getCell("A1");
+
+npaTitle.value = "NPA & SMA";
+
+npaTitle.font = {
+    bold: true,
+    size: 16,
+    color: { argb: "FFFFFFFF" }
+};
+
+npaTitle.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "1E40AF" }
+};
+
+npaTitle.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//-----------------------------------------
+// HEADER
+//-----------------------------------------
+
+npaSheet.mergeCells("B2:C2");
+npaSheet.mergeCells("D2:E2");
+
+npaSheet.getCell("A2").value = "Sections";
+npaSheet.getCell("B2").value = "NPA";
+npaSheet.getCell("D2").value = "SMA (1+2)";
+
+["A2","B2","D2"].forEach(c=>{
+
+const cell=npaSheet.getCell(c);
+
+cell.font={
+bold:true,
+color:{argb:"FFFFFFFF"}
+};
+
+cell.fill={
+type:"pattern",
+pattern:"solid",
+fgColor:{argb:"1E40AF"}
+};
+
+cell.alignment={
+horizontal:"center",
+vertical:"middle"
+};
+
+});
+
+npaSheet.getRow(3).values=[
+"",
+"A/Cs",
+"Balance",
+"A/Cs",
+"Balance"
+];
+
+npaSheet.getRow(3).eachCell(cell=>{
+
+cell.font={
+bold:true,
+color:{argb:"FFFFFFFF"}
+};
+
+cell.fill={
+type:"pattern",
+pattern:"solid",
+fgColor:{argb:"1E40AF"}
+};
+
+cell.alignment={
+horizontal:"center"
+};
+
+});
+
+//-----------------------------------------
+// DATA
+//-----------------------------------------
+
+const rows=[
+
+{
+section:"As on Date",
+npaAcs:card3.asOnAccounts,
+npaBal:card3.asOnBalance,
+smaAcs:sma.asOnAccounts,
+smaBal:sma.asOnBalance
+},
+
+{
+section:"Change over PD",
+npaAcs:card3.pdAccounts,
+npaBal:card3.pdBalance,
+smaAcs:sma.pdAccounts,
+smaBal:sma.pdBalance
+},
+
+{
+section:"Month To Date",
+npaAcs:card3.monthAccounts,
+npaBal:card3.monthBalance,
+smaAcs:sma.monthAccounts,
+smaBal:sma.monthBalance
+},
+
+{
+section:"Previous Year",
+npaAcs:card3.prevAccounts,
+npaBal:card3.prevBalance,
+smaAcs:sma.prevAccounts,
+smaBal:sma.prevBalance
+}
+
+];
+
+rows.forEach(r=>{
+
+const isChangeOverPD = r.section === "Change over PD";
+
+const row = npaSheet.addRow([
+
+    r.section,
+
+    Number(r.npaAcs || 0),
+
+    Number(r.npaBal || 0),
+
+    Number(r.smaAcs || 0),
+
+    Number(r.smaBal || 0)
+
+]);
+
+if (isChangeOverPD) {
+
+    row.getCell(2).value = Math.abs(Number(r.npaAcs || 0));
+
+    row.getCell(3).value =
+        Number((Math.abs(Number(r.npaBal || 0)) / 100000).toFixed(2));
+
+    row.getCell(4).value = Math.abs(Number(r.smaAcs || 0));
+
+    row.getCell(5).value =
+        Number((Math.abs(Number(r.smaBal || 0)) / 100000).toFixed(2));
+
+}
+else {
+
+    row.getCell(5).value =
+        Number((Number(r.smaBal || 0) / 100000).toFixed(2));
+
+}
+
+row.getCell(1).alignment={horizontal:"center"};
+
+for(let i=2;i<=5;i++){
+
+row.getCell(i).alignment={
+horizontal:"right"
+};
+
+}
+
+// NPA Balance
+row.getCell(3).numFmt = '#,##0.00';
+
+// SMA Balance
+row.getCell(5).numFmt = '#,##0.00';
+
+const pdValues = {
+    2: Number(r.npaAcs || 0),
+    3: Number(r.npaBal || 0),
+    4: Number(r.smaAcs || 0),
+    5: Number(r.smaBal || 0)
+};
+
+[2,3,4,5].forEach(col => {
+
+    const value = pdValues[col];
+
+    let color = "111827";
+
+    if (isChangeOverPD) {
+
+        if (value > 0) {
+            color = "DC2626";      // RED (same as frontend)
+        }
+        else if (value < 0) {
+            color = "16A34A";      // GREEN (same as frontend)
+        }
+        else {
+            color = "111827";
+        }
+
+    }
+
+    row.getCell(col).font = {
+        bold: true,
+        name: "Calibri",
+        size: 11,
+        color: {
+            argb: color
+        }
+    };
+
+});
+
+if (r.section === "Change over PD") {
+
+    row.getCell(2).value = Math.abs(Number(r.npaAcs || 0));
+    row.getCell(3).value =
+    Math.abs(Number(r.npaBal || 0)) < 1
+        ? 0
+        : Number(
+            (
+                Math.abs(Number(r.npaBal)) /
+                100000
+            ).toFixed(2)
+        );
+
+    row.getCell(4).value = Math.abs(Number(r.smaAcs || 0));
+    row.getCell(5).value =
+    Math.abs(Number(r.smaBal || 0)) < 1
+        ? 0
+        : Number(
+            (
+                Math.abs(Number(r.smaBal)) /
+                100000
+            ).toFixed(2)
+        );
+
+}
+
+});
+
+//-----------------------------------------
+// % OF ADVANCES
+//-----------------------------------------
+
+const pctRow=
+npaSheet.addRow([]);
+
+pctRow.getCell(1).value="% of Advances (As on Date)";
+
+npaSheet.mergeCells(`B${pctRow.number}:C${pctRow.number}`);
+npaSheet.mergeCells(`D${pctRow.number}:E${pctRow.number}`);
+
+pctRow.getCell(2).value =
+`${formatNumber(card3.percentage)}%`;
+
+pctRow.getCell(4).value =
+`${formatNumber(sma.percentage)}%`;
+
+pctRow.getCell(2).alignment={
+horizontal:"center"
+};
+
+pctRow.getCell(4).alignment={
+horizontal:"center"
+};
+
+pctRow.getCell(2).font={
+bold:true
+};
+
+pctRow.getCell(4).font={
+bold:true
+};
+
+//-----------------------------------------
+// WIDTHS
+//-----------------------------------------
+
+npaSheet.getColumn(1).width=30;
+npaSheet.getColumn(2).width=14;
+npaSheet.getColumn(3).width=18;
+npaSheet.getColumn(4).width=14;
+npaSheet.getColumn(5).width=18;
+
+//-----------------------------------------
+// BORDERS
+//-----------------------------------------
+
+npaSheet.eachRow(row=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+});
+
+});
+
+//------------------------------------------------------
+// DEPOSIT ACCOUNTS OPENED
+//------------------------------------------------------
+
+const doaRequest = pool.request();
+
+doaRequest.input(
+    "level",
+    sql.VarChar(10),
+    r.level
+);
+
+doaRequest.input(
+    "branch_code",
+    sql.Int,
+    r.branch_code ?? null
+);
+
+doaRequest.input(
+    "branch_name",
+    sql.NVarChar(100),
+    r.branch_name ?? null
+);
+
+doaRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level === "CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const doaResult =
+await doaRequest.execute(
+    "get_glance_doa_card4"
+);
+
+const doaRows =
+doaResult.recordsets
+? doaResult.recordsets.flat()
+: doaResult.recordset || [];
+
+//------------------------------------------------------
+// TRANSFORM DOA
+//------------------------------------------------------
+
+const depositData = {
+
+TDR:{type:"TDR"},
+
+RD:{type:"RD"},
+
+Savings:{type:"Savings Account"},
+
+Current:{type:"Current Account"}
+
+};
+
+doaRows.forEach(row=>{
+
+if(row.section==="As on Date"){
+
+depositData.TDR.odAcs=row.tdr_acs;
+depositData.TDR.odAmt=row.tdr_amt;
+
+depositData.RD.odAcs=row.rd_acs;
+depositData.RD.odAmt=row.rd_amt;
+
+depositData.Savings.odAcs=row.sb_acs;
+depositData.Savings.odAmt=row.sb_amt;
+
+depositData.Current.odAcs=row.ca_acs;
+depositData.Current.odAmt=row.ca_amt;
+
+}
+
+if(row.section==="Month To Date"){
+
+depositData.TDR.mtdAcs=row.tdr_acs;
+depositData.TDR.mtdAmt=row.tdr_amt;
+
+depositData.RD.mtdAcs=row.rd_acs;
+depositData.RD.mtdAmt=row.rd_amt;
+
+depositData.Savings.mtdAcs=row.sb_acs;
+depositData.Savings.mtdAmt=row.sb_amt;
+
+depositData.Current.mtdAcs=row.ca_acs;
+depositData.Current.mtdAmt=row.ca_amt;
+
+}
+
+if(row.section==="Previous Year"){
+
+depositData.TDR.ytdAcs=row.tdr_acs;
+depositData.TDR.ytdAmt=row.tdr_amt;
+
+depositData.RD.ytdAcs=row.rd_acs;
+depositData.RD.ytdAmt=row.rd_amt;
+
+depositData.Savings.ytdAcs=row.sb_acs;
+depositData.Savings.ytdAmt=row.sb_amt;
+
+depositData.Current.ytdAcs=row.ca_acs;
+depositData.Current.ytdAmt=row.ca_amt;
+
+}
+
+});
+
+//------------------------------------------------------
+// DEPOSIT ACCOUNTS SHEET
+//------------------------------------------------------
+
+const depositSheet =
+workbook.addWorksheet("Deposit Accounts Opened");
+
+//--------------------------------------
+// TITLE
+//--------------------------------------
+
+depositSheet.mergeCells("A1:G1");
+
+const depositTitle =
+depositSheet.getCell("A1");
+
+depositTitle.value =
+"Deposit Accounts Opened";
+
+depositTitle.font = {
+    bold: true,
+    size: 16,
+    color: {
+        argb: "FFFFFFFF"
+    }
+};
+
+depositTitle.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: {
+        argb: "1E40AF"
+    }
+};
+
+depositTitle.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//--------------------------------------
+// HEADER ROW 1
+//--------------------------------------
+
+depositSheet.mergeCells("A2:A3");
+depositSheet.mergeCells("B2:C2");
+depositSheet.mergeCells("D2:E2");
+depositSheet.mergeCells("F2:G2");
+
+depositSheet.getCell("A2").value = "Section";
+depositSheet.getCell("B2").value = "On Date";
+depositSheet.getCell("D2").value = "Month To Date";
+depositSheet.getCell("F2").value = "Year To Date";
+
+["A2","B2","D2","F2"].forEach(c=>{
+
+const cell=
+depositSheet.getCell(c);
+
+cell.font={
+bold:true,
+color:{argb:"FFFFFFFF"}
+};
+
+cell.fill={
+type:"pattern",
+pattern:"solid",
+fgColor:{argb:"1E40AF"}
+};
+
+cell.alignment={
+horizontal:"center",
+vertical:"middle"
+};
+
+});
+
+//--------------------------------------
+// HEADER ROW 2
+//--------------------------------------
+
+depositSheet.getRow(3).values=[
+
+"",
+"A/Cs",
+"Amount",
+"A/Cs",
+"Amount",
+"A/Cs",
+"Amount"
+
+];
+
+depositSheet.getRow(3).eachCell(cell=>{
+
+cell.font={
+
+bold:true,
+
+color:{
+argb:"FFFFFFFF"
+}
+
+};
+
+cell.fill={
+
+type:"pattern",
+
+pattern:"solid",
+
+fgColor:{
+argb:"1E40AF"
+}
+
+};
+
+cell.alignment={
+
+horizontal:"center"
+
+};
+
+});
+
+//--------------------------------------
+// DATA
+//--------------------------------------
+
+Object.values(depositData).forEach(r=>{
+
+const row=
+depositSheet.addRow([
+
+r.type,
+
+formatAccounts(r.odAcs),
+
+formatNumber(r.odAmt),
+
+formatAccounts(r.mtdAcs),
+
+formatNumber(r.mtdAmt),
+
+formatAccounts(r.ytdAcs),
+
+formatNumber(r.ytdAmt)
+
+]);
+
+// Alignment
+
+row.getCell(1).alignment={
+horizontal:"center"
+};
+
+for(let i=2;i<=7;i++){
+
+row.getCell(i).alignment={
+horizontal:"right"
+};
+
+}
+
+});
+
+//--------------------------------------
+// WIDTH
+//--------------------------------------
+
+depositSheet.getColumn(1).width=28;
+
+depositSheet.getColumn(2).width=14;
+depositSheet.getColumn(3).width=18;
+
+depositSheet.getColumn(4).width=14;
+depositSheet.getColumn(5).width=18;
+
+depositSheet.getColumn(6).width=14;
+depositSheet.getColumn(7).width=18;
+
+//--------------------------------------
+// BORDERS
+//--------------------------------------
+
+depositSheet.eachRow(row=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+});
+
+});
+
+//------------------------------------------------------
+// LOAN ACCOUNTS
+//------------------------------------------------------
+
+const loanRequest = pool.request();
+
+loanRequest.input(
+"level",
+sql.VarChar(10),
+r.level
+);
+
+loanRequest.input(
+"branch_code",
+sql.Int,
+r.branch_code ?? null
+);
+
+loanRequest.input(
+"branch_name",
+sql.NVarChar(100),
+r.branch_name ?? null
+);
+
+loanRequest.input(
+"cluster_name",
+sql.VarChar(50),
+r.level==="CLUSTER"
+? r.cluster_name
+: null
+);
+
+const loanResult =
+await loanRequest.execute(
+"get_glance_loans_card5"
+);
+
+const loanRows =
+loanResult.recordset || [];
+
+//------------------------------------------------------
+// TRANSFORM LOANS
+//------------------------------------------------------
+
+const loanMap = {};
+
+loanRows.forEach(row=>{
+
+if(!loanMap[row.loan_group]){
+
+loanMap[row.loan_group]={
+
+loanType:row.loan_group
+
+};
+
+}
+
+if(row.period_type==="ON_DATE"){
+
+loanMap[row.loan_group].odAcs=row.acs;
+loanMap[row.loan_group].odAmt=row.amount;
+
+}
+
+if(row.period_type==="MONTH"){
+
+loanMap[row.loan_group].mtdAcs=row.acs;
+loanMap[row.loan_group].mtdAmt=row.amount;
+
+}
+
+if(row.period_type==="YEAR"){
+
+loanMap[row.loan_group].ytdAcs=row.acs;
+loanMap[row.loan_group].ytdAmt=row.amount;
+
+}
+
+});
+
+//------------------------------------------------------
+// LOAN ACCOUNTS OPENED SHEET
+//------------------------------------------------------
+
+const loanSheet =
+workbook.addWorksheet("Loan Accounts Opened");
+
+//--------------------------------------
+// TITLE
+//--------------------------------------
+
+loanSheet.mergeCells("A1:G1");
+
+const loanTitle =
+loanSheet.getCell("A1");
+
+loanTitle.value =
+"Loan Accounts Opened";
+
+loanTitle.font = {
+    bold: true,
+    size: 16,
+    color: {
+        argb: "FFFFFFFF"
+    }
+};
+
+loanTitle.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: {
+        argb: "1E40AF"
+    }
+};
+
+loanTitle.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//--------------------------------------
+// HEADER
+//--------------------------------------
+
+loanSheet.mergeCells("A2:A3");
+loanSheet.mergeCells("B2:C2");
+loanSheet.mergeCells("D2:E2");
+loanSheet.mergeCells("F2:G2");
+
+loanSheet.getCell("A2").value="Loan Type";
+loanSheet.getCell("B2").value="On Date";
+loanSheet.getCell("D2").value="Month To Date";
+loanSheet.getCell("F2").value="Year To Date";
+
+["A2","B2","D2","F2"].forEach(c=>{
+
+const cell=
+loanSheet.getCell(c);
+
+cell.font={
+bold:true,
+color:{
+argb:"FFFFFFFF"
+}
+};
+
+cell.fill={
+type:"pattern",
+pattern:"solid",
+fgColor:{
+argb:"1E40AF"
+}
+};
+
+cell.alignment={
+horizontal:"center",
+vertical:"middle"
+};
+
+});
+
+//--------------------------------------
+// SUB HEADER
+//--------------------------------------
+
+loanSheet.getRow(3).values=[
+
+"",
+"A/Cs",
+"Amount",
+"A/Cs",
+"Amount",
+"A/Cs",
+"Amount"
+
+];
+
+loanSheet.getRow(3).eachCell(cell=>{
+
+cell.font={
+bold:true,
+color:{
+argb:"FFFFFFFF"
+}
+};
+
+cell.fill={
+type:"pattern",
+pattern:"solid",
+fgColor:{
+argb:"1E40AF"
+}
+};
+
+cell.alignment={
+horizontal:"center"
+};
+
+});
+
+//--------------------------------------
+// SORT LOAN GROUPS
+//--------------------------------------
+
+const LOAN_GROUP_ORDER=[
+
+"GOLD LOANS",
+
+"LOAN AGAINST DEPOSIT",
+
+"PRAGATHI LOANS",
+
+"TERM LOAN (NON-PRIORITY)",
+
+"HOME LOANS",
+
+"CRE",
+
+"AGRI LOANS",
+
+"VEHICLE LOANS",
+
+"TERM LOAN (PRIORITY)",
+
+"OTHERS"
+
+];
+
+const sortedLoans=
+Object.values(loanMap).sort((a,b)=>{
+
+const ia=
+LOAN_GROUP_ORDER.indexOf(a.loanType);
+
+const ib=
+LOAN_GROUP_ORDER.indexOf(b.loanType);
+
+return(
+(ia===-1?999:ia)-
+(ib===-1?999:ib)
+);
+
+});
+
+//--------------------------------------
+// DATA
+//--------------------------------------
+
+sortedLoans.forEach(r=>{
+
+const row=
+loanSheet.addRow([
+
+r.loanType,
+
+formatAccounts(r.odAcs),
+
+formatNumber(r.odAmt),
+
+formatAccounts(r.mtdAcs),
+
+formatNumber(r.mtdAmt),
+
+formatAccounts(r.ytdAcs),
+
+formatNumber(r.ytdAmt)
+
+]);
+
+row.getCell(1).alignment={
+horizontal:"center",
+vertical:"middle",
+wrapText:true
+};
+
+for(let i=2;i<=7;i++){
+
+row.getCell(i).alignment={
+horizontal:"right"
+};
+
+}
+
+});
+
+//--------------------------------------
+// COLUMN WIDTHS
+//--------------------------------------
+
+loanSheet.getColumn(1).width=35;
+
+loanSheet.getColumn(2).width=14;
+loanSheet.getColumn(3).width=18;
+
+loanSheet.getColumn(4).width=14;
+loanSheet.getColumn(5).width=18;
+
+loanSheet.getColumn(6).width=14;
+loanSheet.getColumn(7).width=18;
+
+//--------------------------------------
+// BORDERS
+//--------------------------------------
+
+loanSheet.eachRow(row=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+});
+
+});
+
+//------------------------------------------------------
+// BUSINESS CORRESPONDENTS
+//------------------------------------------------------
+
+const bcRequest = pool.request();
+
+bcRequest.input("level", sql.VarChar(10), r.level);
+
+bcRequest.input("branch_code", sql.Int, r.branch_code ?? null);
+
+bcRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+bcRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level === "CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const bcResult =
+await bcRequest.execute(
+    "get_glance_business_correspondents"
+);
+
+const bcData =
+bcResult.recordset?.[0] || {};
+
+//------------------------------------------------------
+// ATM COUNT
+//------------------------------------------------------
+
+const atmRequest = pool.request();
+
+atmRequest.input("level", sql.VarChar(10), r.level);
+
+atmRequest.input("branch_code", sql.Int, r.branch_code ?? null);
+
+atmRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+atmRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level==="CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const atmResult =
+await atmRequest.execute(
+    "get_glance_atms"
+);
+
+const atmData =
+atmResult.recordset?.[0] || {};
+
+//------------------------------------------------------
+// EMPLOYEE EFFICIENCY
+//------------------------------------------------------
+
+const empRequest = pool.request();
+
+empRequest.input("level", sql.VarChar(10), r.level);
+
+empRequest.input("branch_code", sql.Int, r.branch_code ?? null);
+
+empRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+empRequest.input(
+    "cluster_name",
+    sql.VarChar(50),
+    r.level==="CLUSTER"
+        ? r.cluster_name
+        : null
+);
+
+const empResult =
+await empRequest.execute(
+    "get_glance_employee_efficiency"
+);
+
+const empData =
+empResult.recordset?.[0] || {};
+
+//------------------------------------------------------
+// EMPLOYEE EFFICIENCY SHEET
+//------------------------------------------------------
+
+const employeeSheet =
+workbook.addWorksheet("Employee Efficiency");
+
+//--------------------------------------
+// TITLE
+//--------------------------------------
+
+employeeSheet.mergeCells("A1:C1");
+
+const empTitle =
+employeeSheet.getCell("A1");
+
+empTitle.value =
+"Employee Efficiency";
+
+empTitle.font = {
+    bold: true,
+    size: 16,
+    color: { argb: "FFFFFFFF" }
+};
+
+empTitle.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "1E40AF" }
+};
+
+empTitle.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//--------------------------------------
+// HEADER
+//--------------------------------------
+
+employeeSheet.addRow([
+    "Section",
+    "On Date",
+    "Previous Year"
+]);
+
+const empHeader =
+employeeSheet.getRow(2);
+
+empHeader.font = {
+    bold: true,
+    color: { argb: "FFFFFFFF" }
+};
+
+empHeader.eachCell(cell=>{
+
+cell.fill={
+
+type:"pattern",
+
+pattern:"solid",
+
+fgColor:{argb:"1E40AF"}
+
+};
+
+});
+
+empHeader.alignment = {
+    horizontal: "center",
+    vertical: "middle"
+};
+
+//--------------------------------------
+// DATA
+//--------------------------------------
+
+employeeSheet.addRow([
+
+"Number of Staff\n(Excluding Sub Staff)",
+
+formatAccounts(empData.no_of_staff),
+
+formatAccounts(empData.no_of_staff_previous_year)
+
+]);
+
+employeeSheet.addRow([
+
+"Business Per Employee",
+
+formatNumber(empData.business_per_employee),
+
+formatNumber(empData.business_per_employee_previous_year)
+
+]);
+
+//--------------------------------------
+// FORMATTING
+//--------------------------------------
+
+employeeSheet.getColumn(1).width = 40;
+employeeSheet.getColumn(2).width = 20;
+employeeSheet.getColumn(3).width = 20;
+
+employeeSheet.eachRow((row,rowNumber)=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+if(rowNumber>=3){
+
+if(cell.col===1){
+
+cell.alignment={
+horizontal:"center",
+vertical:"middle",
+wrapText:true
+};
+
+}else{
+
+cell.alignment={
+horizontal:"right"
+};
+
+}
+
+}
+
+});
+
+});
+
+//------------------------------------------------------
+// VOUCHERS
+//------------------------------------------------------
+
+const voucherRequest = pool.request();
+
+voucherRequest.input("level", sql.VarChar(10), r.level);
+
+voucherRequest.input("branch_code", sql.Int, r.branch_code ?? null);
+
+voucherRequest.input("branch_name", sql.VarChar(100), r.branch_name ?? null);
+
+voucherRequest.input(
+"cluster_name",
+sql.VarChar(50),
+r.level==="CLUSTER"
+? r.cluster_name
+: null
+);
+
+const voucherResult =
+await voucherRequest.execute(
+"get_glance_vouchers"
+);
+
+const voucher =
+voucherResult.recordset?.[0] || {};
+
+//------------------------------------------------------
+// VOUCHERS SHEET
+//------------------------------------------------------
+
+const voucherSheet =
+workbook.addWorksheet("Vouchers");
+
+//--------------------------------------
+// TITLE
+//--------------------------------------
+
+voucherSheet.mergeCells("A1:B1");
+
+const voucherTitle =
+voucherSheet.getCell("A1");
+
+voucherTitle.value =
+"Vouchers";
+
+voucherTitle.font = {
+    bold: true,
+    size: 16,
+    color: {
+        argb:"FFFFFFFF"
+    }
+};
+
+voucherTitle.fill = {
+    type:"pattern",
+    pattern:"solid",
+    fgColor:{
+        argb:"1E40AF"
+    }
+};
+
+voucherTitle.alignment = {
+    horizontal:"center",
+    vertical:"middle"
+};
+
+//--------------------------------------
+// HEADER
+//--------------------------------------
+
+voucherSheet.addRow([
+
+"On Date",
+
+"Average"
+
+]);
+
+const voucherHeader =
+voucherSheet.getRow(2);
+
+voucherHeader.font = {
+
+bold:true,
+
+color:{
+argb:"FFFFFFFF"
+}
+
+};
+
+voucherHeader.eachCell(cell=>{
+
+cell.fill={
+
+type:"pattern",
+
+pattern:"solid",
+
+fgColor:{argb:"1E40AF"}
+
+};
+
+});
+
+voucherHeader.alignment = {
+
+horizontal:"center"
+
+};
+
+//--------------------------------------
+// DATA
+//--------------------------------------
+
+voucherSheet.addRow([
+
+formatAccounts(voucher.vouchers),
+
+formatAccounts(voucher.vouchers_average)
+
+]);
+
+//--------------------------------------
+// FORMAT
+//--------------------------------------
+
+voucherSheet.getColumn(1).width=20;
+voucherSheet.getColumn(2).width=20;
+
+voucherSheet.eachRow((row,rowNumber)=>{
+
+row.eachCell(cell=>{
+
+cell.border={
+
+top:{style:"thin"},
+
+left:{style:"thin"},
+
+bottom:{style:"thin"},
+
+right:{style:"thin"}
+
+};
+
+if(rowNumber>=3){
+
+cell.alignment={
+horizontal:"center"
+};
+
+}
+
+});
+
+});
+
+        //-----------------------------------------
+        // Return Excel
+        //-----------------------------------------
+
+        res.setHeader(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+
+        res.setHeader(
+            "Content-Disposition",
+            "attachment; filename=At_A_Glance.xlsx"
+        );
+
+        await workbook.xlsx.write(res);
+
+        res.end();
+
+    }
+
+    catch (err) {
+
+        console.error(
+            "GLANCE_EXPORT_FAILED",
+            err
+        );
+
+        res.status(500).json({
+
+            success: false,
+
+            message: err.message
+
+        });
+
+    }
+
+});
+
+
+
+app.get(
+  "/dashboard-session-check",
+  dashboardAuthMiddleware,
+  (req, res) => {
+
+    res.json({
+      success: true
+    });
+
+  }
+);
+
+
+
+
+
+
+
+// ======================
+// FRONTEND LOGGING API
+// ======================
+
+app.post("/api/frontend-log", (req, res) => {
+
+  console.log(
+    "FRONTEND_LOG_API_HIT",
+    req.body
+  );
+
+  try {
+
+    const {
+      source,
+      level,
+      message
+    } = req.body;
+
+    if (!message) {
+
+      console.warn(
+        "FRONTEND_LOG_EMPTY_MESSAGE"
+      );
+
+      return res.status(400).json({
+        success: false
+      });
+
+    }
+
+    writeDailyLog(
+      `frontend/${source}`,
+      `[${level}] ${message}`
+    );
+
+    console.log(
+      "FRONTEND_LOG_WRITTEN"
+    );
+
+    return res.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error(
+      "FRONTEND_LOG_ERROR",
+      err
+    );
+
+    return res.status(500).json({
+      success: false
+    });
+
+  }
+
+});
 
 //============================================================================================
 //                                          SERVER CONNECTION
